@@ -1,0 +1,11 @@
+# Ignore model checkpoints
+/ckpts/
+/data/infos/
+/data/bench2drive/
+/bench2drive_eval/
+/build/
+*.so
+*.o
+*.pyc
+__pycache__/
+/mmcv.egg-info/
