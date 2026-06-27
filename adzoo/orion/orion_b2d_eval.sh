@@ -85,7 +85,23 @@ export GPU_RANK
 export GPU_RANK_LIST
 export CARLA_GPU
 export MODEL_GPU
-export PYTHONPATH="$ORION_ROOT:$B2D_ROOT:$LEADERBOARD_ROOT:$SCENARIO_RUNNER_ROOT:$CARLA_ROOT/PythonAPI:$CARLA_ROOT/PythonAPI/carla:${PYTHONPATH:-}"
+CARLA_PYTHON_DIST=""
+for candidate in \
+    "$CARLA_ROOT"/PythonAPI/carla/dist/carla-*py3*.egg \
+    "$CARLA_ROOT"/PythonAPI/carla/dist/carla-*cp3*.whl \
+    "$CARLA_ROOT"/PythonAPI/carla/dist/carla-*.egg \
+    "$CARLA_ROOT"/PythonAPI/carla/dist/carla-*.whl
+do
+    if [ -e "$candidate" ]; then
+        CARLA_PYTHON_DIST=$candidate
+        break
+    fi
+done
+if [ -n "$CARLA_PYTHON_DIST" ]; then
+    export PYTHONPATH="$CARLA_PYTHON_DIST:$ORION_ROOT:$B2D_ROOT:$LEADERBOARD_ROOT:$SCENARIO_RUNNER_ROOT:$CARLA_ROOT/PythonAPI:$CARLA_ROOT/PythonAPI/carla:${PYTHONPATH:-}"
+else
+    export PYTHONPATH="$ORION_ROOT:$B2D_ROOT:$LEADERBOARD_ROOT:$SCENARIO_RUNNER_ROOT:$CARLA_ROOT/PythonAPI:$CARLA_ROOT/PythonAPI/carla:${PYTHONPATH:-}"
+fi
 mkdir -p "$(dirname -- "$CHECKPOINT_ENDPOINT")" "$B2D_CKPT_DIR"
 if [[ "${ORION_EVAL_VISUALIZATION,,}" == "1" || "${ORION_EVAL_VISUALIZATION,,}" == "true" || "${ORION_EVAL_VISUALIZATION,,}" == "yes" || "${ORION_EVAL_VISUALIZATION,,}" == "on" ]]; then
     mkdir -p "$SAVE_PATH"

@@ -38,6 +38,7 @@ IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
 VISUALIZATION = str(os.environ.get('ORION_EVAL_VISUALIZATION', 'false')).strip().lower() in {
     '1', 'true', 'yes', 'on'
 }
+BEV_VISUALIZATION = SAVE_PATH is not None and VISUALIZATION
 
 def get_entry_point():
     return 'OrionAgent'
@@ -105,7 +106,7 @@ class OrionAgent(autonomous_agent.AutonomousAgent):
         control.throttle = 0.0
         control.brake = 0.0	
         self.prev_control = control
-        if SAVE_PATH is not None and VISUALIZATION:
+        if BEV_VISUALIZATION:
             now = datetime.datetime.now()
             # string = pathlib.Path(os.environ['ROUTES']).stem + '_'
             string = self.save_name
@@ -278,7 +279,7 @@ class OrionAgent(autonomous_agent.AutonomousAgent):
                     'id': 'SPEED'
                 },       
             ]
-        if IS_BENCH2DRIVE:
+        if BEV_VISUALIZATION:
             sensors += [
                     {	
                         'type': 'sensor.camera.rgb',
@@ -305,7 +306,6 @@ class OrionAgent(autonomous_agent.AutonomousAgent):
         # cv2.imwrite('./work_dirs/tick_input_img.jpg', img)
         # bev = cv2.cvtColor(input_data['bev'][1][:, :, :3], cv2.COLOR_BGR2RGB)
 
-        bev = input_data['bev'][1][:, :, :3]
         gps = input_data['GPS'][1][:2]
         speed = input_data['SPEED'][1]['speed']
         compass = input_data['IMU'][1][-1]
@@ -326,13 +326,14 @@ class OrionAgent(autonomous_agent.AutonomousAgent):
                 'pos':pos,
                 'speed': speed,
                 'compass': compass,
-                'bev': bev,
                 'acceleration':acceleration,
                 'angular_velocity':angular_velocity,
                 'command_curr':curr_command,
                 'command_near':near_command,
                 'command_near_xy':near_node
                 }
+        if 'bev' in input_data:
+            result['bev'] = input_data['bev'][1][:, :, :3]
         
         return result
     
@@ -454,7 +455,8 @@ class OrionAgent(autonomous_agent.AutonomousAgent):
         Image.fromarray(cvt_c(tick_data['imgs']['CAM_BACK'])).save(self.save_path / 'rgb_back' / ('%04d.png' % frame))
         Image.fromarray(cvt_c(tick_data['imgs']['CAM_BACK_LEFT'])).save(self.save_path / 'rgb_back_left' / ('%04d.png' % frame))
         Image.fromarray(cvt_c(tick_data['imgs']['CAM_BACK_RIGHT'])).save(self.save_path / 'rgb_back_right' / ('%04d.png' % frame))
-        Image.fromarray(cvt_c(tick_data['bev'])).save(self.save_path / 'bev' / ('%04d.png' % frame))
+        if 'bev' in tick_data:
+            Image.fromarray(cvt_c(tick_data['bev'])).save(self.save_path / 'bev' / ('%04d.png' % frame))
         outfile = open(self.save_path / 'meta' / ('%04d.json' % frame), 'w')
         json.dump(self.pid_metadata, outfile, indent=4)
         outfile.close()
