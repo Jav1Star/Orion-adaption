@@ -199,12 +199,14 @@ class LeaderboardEvaluator(object):
         Prepares the simulation by getting the client, and setting up the world and traffic manager settings
         """
         self.carla_path = os.environ["CARLA_ROOT"]
+        startup_wait = float(os.environ.get("CARLA_STARTUP_WAIT", "30"))
         args.port = find_free_port(args.port)
         cmd1 = f"{os.path.join(self.carla_path, 'CarlaUE4.sh')} -RenderOffScreen -nosound -carla-rpc-port={args.port} -graphicsadapter={args.gpu_rank}"
         self.server = subprocess.Popen(cmd1, shell=True, preexec_fn=os.setsid)
         print(cmd1, self.server.returncode, flush=True)
         atexit.register(os.killpg, self.server.pid, signal.SIGKILL)
-        time.sleep(30)
+        print(f"waiting {startup_wait}s for CARLA startup", flush=True)
+        time.sleep(startup_wait)
             
         attempts = 0
         num_max_restarts = 20

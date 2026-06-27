@@ -2,6 +2,38 @@ _base_ = ["../_base_/datasets/nus-3d.py",
           "../_base_/default_runtime.py"]
 backbone_norm_cfg = dict(type='LN', requires_grad=True)
 
+
+def _detect_flash_attn_support():
+    try:
+        torch_mod = __import__('torch')
+    except Exception as exc:
+        print(f"[orion config] Failed to import torch, disable flash_attn: {exc}")
+        return False
+
+    if not torch_mod.cuda.is_available():
+        print("[orion config] CUDA is unavailable, disable flash_attn.")
+        return False
+
+    try:
+        device_index = torch_mod.cuda.current_device()
+        device_name = torch_mod.cuda.get_device_name(device_index)
+        major, minor = torch_mod.cuda.get_device_capability(device_index)
+    except Exception as exc:
+        print(f"[orion config] Failed to inspect CUDA device, disable flash_attn: {exc}")
+        return False
+
+    use_flash_attn = major >= 8
+    status = "enable" if use_flash_attn else "disable"
+    print(
+        f"[orion config] Detected GPU {device_name} "
+        f"(compute capability {major}.{minor}), {status} flash_attn."
+    )
+    return use_flash_attn
+
+
+use_flash_attn = _detect_flash_attn_support()
+del _detect_flash_attn_support
+
 # If point cloud range is changed, the models should also change their point
 # cloud range accordingly
 point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
@@ -159,7 +191,7 @@ num_gpus = 32
 batch_size = 4
 num_iters_per_epoch = 234769 // (num_gpus * batch_size)
 num_epochs = 6
-llm_path = 'ckpts/pretrain_qformer/'
+llm_path = '/raid/yyj/Orion-adaption/Orion/pretrain_qformer/'
 use_gen_token = True
 use_col_loss = True
 collect_keys = ['lidar2img', 'cam_intrinsic', 'timestamp', 'ego_pose', 'ego_pose_inv', 'command']
@@ -199,7 +231,7 @@ model = dict(
         ),
         qkv_bias=True,
         drop_path_rate=0.3,
-        flash_attn=True,
+        flash_attn=use_flash_attn,
         with_cp=True, 
         frozen=False,), 
     map_head=dict(
@@ -229,7 +261,7 @@ model = dict(
                  feedforward_dims=2048,
                  dropout=0.1,
                  with_cp=True,
-                 flash_attn=True,)), #
+                 flash_attn=use_flash_attn,)), #
     pts_bbox_head=dict(
         type='OrionHead',
         num_classes=9,
@@ -259,7 +291,7 @@ model = dict(
             dropout=0.0,
             feedforward_dims=_ffn_dim_,
             with_cp=True,
-            flash_attn=True,
+            flash_attn=use_flash_attn,
             return_intermediate=False,
             ),
         code_weights = [2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
@@ -279,7 +311,7 @@ model = dict(
             dropout=0.0,
             feedforward_dims=_ffn_dim_,
             with_cp=True,
-            flash_attn=True,
+            flash_attn=use_flash_attn,
             return_intermediate=False),
         transformer=dict(
             type='PETRTemporalTransformer',
@@ -291,7 +323,7 @@ model = dict(
                  feedforward_dims=2048,
                  dropout=0.1,
                  with_cp=True,
-                 flash_attn=True,
+                 flash_attn=use_flash_attn,
             ),
         bbox_coder=dict(
             type='CustomNMSFreeCoder',

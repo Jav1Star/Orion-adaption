@@ -490,5 +490,7 @@ class RouteScenario(BasicScenario):
         """
         Remove all actors upon deletion
         """
-        self.client.apply_batch([carla.command.DestroyActor(x) for x in self._parked_ids])
+        parked_ids = getattr(self, "_parked_ids", None)
+        if parked_ids:
+            self.client.apply_batch([carla.command.DestroyActor(x) for x in parked_ids])
         self.remove_all_actors()

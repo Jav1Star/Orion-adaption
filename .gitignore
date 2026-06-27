@@ -9,3 +9,6 @@
 *.pyc
 __pycache__/
 /mmcv.egg-info/
+*.pth
+*.bin
+*.model
