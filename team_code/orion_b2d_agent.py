@@ -35,6 +35,9 @@ from pyquaternion import Quaternion
 from scipy.optimize import fsolve
 SAVE_PATH = os.environ.get('SAVE_PATH', None)
 IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
+VISUALIZATION = str(os.environ.get('ORION_EVAL_VISUALIZATION', 'false')).strip().lower() in {
+    '1', 'true', 'yes', 'on'
+}
 
 def get_entry_point():
     return 'OrionAgent'
@@ -102,7 +105,7 @@ class OrionAgent(autonomous_agent.AutonomousAgent):
         control.throttle = 0.0
         control.brake = 0.0	
         self.prev_control = control
-        if SAVE_PATH is not None:
+        if SAVE_PATH is not None and VISUALIZATION:
             now = datetime.datetime.now()
             # string = pathlib.Path(os.environ['ROUTES']).stem + '_'
             string = self.save_name
@@ -437,7 +440,7 @@ class OrionAgent(autonomous_agent.AutonomousAgent):
         self.pid_metadata['local_command_xy '] = local_command_xy.tolist()
         metric_info = self.get_metric_info()
         self.metric_info[self.step] = metric_info     
-        if SAVE_PATH is not None and self.step % 10 == 0:
+        if self.save_path is not None and self.step % 10 == 0:
             self.save(tick_data)
         self.prev_control = control
         return control
