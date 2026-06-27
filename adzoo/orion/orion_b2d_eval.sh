@@ -2,17 +2,52 @@
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 CHECKPOINT_PATH [GPU_RANK]" >&2
+    echo "Usage: $0 CONFIG_PATH [CHECKPOINT_PATH]" >&2
+    echo "   or: $0 CHECKPOINT_PATH [GPU_RANK]" >&2
     exit 1
 fi
 
-CHECKPOINT_PATH=$1
-GPU_RANK=${2:-0}
-CARLA_GPU=${CARLA_GPU:-$GPU_RANK}
-MODEL_GPU=${MODEL_GPU:-$GPU_RANK}
-
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 ORION_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+
+CHECKPOINT_PATH=""
+GPU_RANK="${GPU_RANK:-0}"
+CONFIG_PATH=""
+
+if [[ "$1" == *.sh || "$1" == *.env ]]; then
+    CONFIG_PATH=$1
+    shift
+    # shellcheck source=/dev/null
+    source "$CONFIG_PATH"
+    if [ $# -ge 1 ]; then
+        CHECKPOINT_PATH=$1
+        shift
+    else
+        CHECKPOINT_PATH=${CHECKPOINT_PATH:-${EVAL_CHECKPOINT_PATH:-}}
+    fi
+else
+    CHECKPOINT_PATH=$1
+    shift
+    if [ $# -ge 1 ]; then
+        GPU_RANK=$1
+        shift
+    fi
+fi
+
+if [ -z "$CHECKPOINT_PATH" ]; then
+    echo "CHECKPOINT_PATH is required. Pass it as the second arg or set CHECKPOINT_PATH/EVAL_CHECKPOINT_PATH in config." >&2
+    exit 1
+fi
+
+GPU_RANK_LIST=${GPU_RANK_LIST:-}
+if [ -n "$GPU_RANK_LIST" ]; then
+    CARLA_GPU=${CARLA_GPU:-$GPU_RANK_LIST}
+    MODEL_GPU=${MODEL_GPU:-$GPU_RANK_LIST}
+else
+    CARLA_GPU=${CARLA_GPU:-$GPU_RANK}
+    MODEL_GPU=${MODEL_GPU:-$GPU_RANK}
+fi
+
 B2D_ROOT="$ORION_ROOT/Bench2Drive"
 LEADERBOARD_ROOT="$B2D_ROOT/leaderboard"
 SCENARIO_RUNNER_ROOT="$B2D_ROOT/scenario_runner"
@@ -36,6 +71,7 @@ export CHALLENGE_TRACK_CODENAME=SENSORS
 export DEBUG_CHALLENGE=${DEBUG_CHALLENGE:-0}
 export REPETITIONS=${REPETITIONS:-1}
 export RESUME=${RESUME:-True}
+export ORION_EVAL_VISUALIZATION=${ORION_EVAL_VISUALIZATION:-false}
 export TEAM_AGENT
 export TEAM_CONFIG
 export CHECKPOINT_ENDPOINT
@@ -46,10 +82,14 @@ export TM_PORT
 export IS_BENCH2DRIVE
 export PLANNER_TYPE
 export GPU_RANK
+export GPU_RANK_LIST
 export CARLA_GPU
 export MODEL_GPU
 export PYTHONPATH="$ORION_ROOT:$B2D_ROOT:$LEADERBOARD_ROOT:$SCENARIO_RUNNER_ROOT:$CARLA_ROOT/PythonAPI:$CARLA_ROOT/PythonAPI/carla:${PYTHONPATH:-}"
-mkdir -p "$(dirname -- "$CHECKPOINT_ENDPOINT")" "$SAVE_PATH" "$B2D_CKPT_DIR"
+mkdir -p "$(dirname -- "$CHECKPOINT_ENDPOINT")" "$B2D_CKPT_DIR"
+if [[ "${ORION_EVAL_VISUALIZATION,,}" == "1" || "${ORION_EVAL_VISUALIZATION,,}" == "true" || "${ORION_EVAL_VISUALIZATION,,}" == "yes" || "${ORION_EVAL_VISUALIZATION,,}" == "on" ]]; then
+    mkdir -p "$SAVE_PATH"
+fi
 if [ -d "$ORION_ASSET_ROOT/pretrain_qformer" ]; then
     ln -sfn "$ORION_ASSET_ROOT/pretrain_qformer" "$B2D_CKPT_DIR/pretrain_qformer"
 elif [ -d "$ORION_ROOT/ckpts/pretrain_qformer" ]; then
@@ -57,4 +97,5 @@ elif [ -d "$ORION_ROOT/ckpts/pretrain_qformer" ]; then
 fi
 cd "$B2D_ROOT"
 PYTHON_BIN=${PYTHON_BIN:-/home/yyj/miniconda3/envs/orion/bin/python}
-CUDA_VISIBLE_DEVICES=${MODEL_GPU} "$PYTHON_BIN" "$LEADERBOARD_ROOT/leaderboard/leaderboard_evaluator.py"   --routes="$ROUTES"   --repetitions="$REPETITIONS"   --track="$CHALLENGE_TRACK_CODENAME"   --checkpoint="$CHECKPOINT_ENDPOINT"   --agent="$TEAM_AGENT"   --agent-config="$TEAM_CONFIG"   --debug="$DEBUG_CHALLENGE"   --record="${RECORD_PATH:-}"   --resume="$RESUME"   --port="$PORT"   --traffic-manager-port="$TM_PORT"   --gpu-rank="$CARLA_GPU"
+export PYTHON_BIN
+"$PYTHON_BIN" "$ORION_ROOT/adzoo/orion/orion_b2d_eval_runner.py"
