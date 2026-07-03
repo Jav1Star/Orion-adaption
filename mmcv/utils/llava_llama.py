@@ -21,15 +21,26 @@ import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 
 from transformers import AutoConfig, AutoModelForCausalLM, \
-                         LlamaConfig, LlamaModel, LlamaForCausalLM
+                         LlamaConfig, LlamaForCausalLM
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
+from .modeling_llama_orion import LlamaModel
 
 
 class LlavaConfig(LlamaConfig):
     model_type = "llava_llama"
+
+    def __init__(
+        self,
+        adalava_enabled: bool = False,
+        num_prefix_layers: Optional[int] = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.adalava_enabled = bool(adalava_enabled)
+        self.num_prefix_layers = None if num_prefix_layers is None else int(num_prefix_layers)
 
 
 class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
@@ -95,6 +106,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
         return_ego_feature: Optional[bool] = False,
+        adalava_controller=None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         if inputs_embeds is None:
@@ -113,10 +125,13 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 past_key_values,
                 labels,
                 images,
-                image_sizes
+                image_sizes,
+                adalava_controller=adalava_controller,
             )
         else:
             new_input_ids = None
+        if adalava_controller is not None and new_input_ids is not None:
+            adalava_controller.prepare_llm_runtime(new_input_ids)
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -134,6 +149,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             output_attentions=output_attentions, # False
             output_hidden_states=output_hidden_states, # False
             return_dict=return_dict, # True
+            adalava_controller=adalava_controller,
         )
         # find 2d position  self.model.to(torch.float32)
         hidden_states = outputs[0]
@@ -246,6 +262,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.Tensor] = None,
         image_sizes: Optional[torch.Tensor] = None,
         return_ego_feature = False,
+        adalava_controller=None,
         **kwargs,
     ):
         position_ids = kwargs.pop("position_ids", None)
@@ -269,10 +286,14 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 None,
                 None,
                 images,
-                image_sizes=image_sizes
+                image_sizes=image_sizes,
+                adalava_controller=adalava_controller,
             )
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
+            new_input_ids = inputs
+        if adalava_controller is not None and new_input_ids is not None:
+            adalava_controller.prepare_llm_runtime(new_input_ids)
         output_attentions = self.config.output_attentions
         output_hidden_states = (
             self.config.output_hidden_states
@@ -290,6 +311,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            adalava_controller=adalava_controller,
         )
         # find 2d position  self.model.to(torch.float32)
         hidden_states = outputs[0]
@@ -317,6 +339,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                                       inputs_embeds=None, **kwargs):
         images = kwargs.pop("images", None)
         image_sizes = kwargs.pop("image_sizes", None)
+        adalava_controller = kwargs.pop("adalava_controller", None)
         inputs = super().prepare_inputs_for_generation(
             input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs
         )
@@ -324,6 +347,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             inputs['images'] = images
         if image_sizes is not None:
             inputs['image_sizes'] = image_sizes
+        if adalava_controller is not None:
+            inputs['adalava_controller'] = adalava_controller
         return inputs
 
 AutoConfig.register("llava_llama", LlavaConfig)

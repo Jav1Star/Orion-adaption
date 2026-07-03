@@ -1,5 +1,6 @@
 _base_ = ["../_base_/datasets/nus-3d.py",
-          "../_base_/default_runtime.py"]
+          "../_base_/default_runtime.py",
+          "./orion-adaption.py"]
 backbone_norm_cfg = dict(type='LN', requires_grad=True)
 
 # plugin=True
@@ -168,7 +169,6 @@ num_gpus = 32
 batch_size = 4
 num_iters_per_epoch = 234769 // (num_gpus * batch_size)
 num_epochs = 6
-llm_path = '/raid/yyj/Orion-adaption/Orion/pretrain_qformer/'
 use_gen_token = True
 use_col_loss = True
 collect_keys = ['lidar2img', 'cam_intrinsic', 'timestamp', 'ego_pose', 'ego_pose_inv', 'command']
@@ -189,6 +189,7 @@ model = dict(
     use_lora=True,
     tokenizer=llm_path,
     lm_head=llm_path, # set to None if don't use llm head
+    adaption_cfg=orion_adaption_cfg,
     use_gen_token = use_gen_token,
     use_diff_decoder = False, 
     use_col_loss = use_col_loss,
