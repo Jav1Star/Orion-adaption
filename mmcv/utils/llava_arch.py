@@ -32,6 +32,8 @@ from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn
 
+from .adalava_assigner import ADALAVA_BUDGET_TOKEN_INDEX, ADALAVA_PATH_TOKEN_INDEX
+
 class LlavaMetaModel:
 
     def __init__(self, config):
@@ -47,7 +49,15 @@ class LlavaMetaForCausalLM(ABC):
         return self.get_model().get_vision_tower()
 
     def prepare_inputs_labels_for_multimodal(
-        self, input_ids, position_ids, attention_mask, past_key_values, labels, image_features, image_sizes
+        self,
+        input_ids,
+        position_ids,
+        attention_mask,
+        past_key_values,
+        labels,
+        image_features,
+        image_sizes,
+        adalava_controller=None,
     ):
         
         if  image_features is None or input_ids.shape[1] == 1:
@@ -135,6 +145,36 @@ class LlavaMetaForCausalLM(ABC):
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
                     cur_new_input_ids.append(torch.full((cur_image_features.shape[0],), IMAGE_TOKEN_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+                    if adalava_controller is not None:
+                        # 关键调用点：query token 作为内部 embedding 插入，不要求外部 prompt 显式携带特殊 token。
+                        budget_query_embed, path_query_embed = adalava_controller.get_query_embeddings(
+                            device=cur_image_features.device,
+                            dtype=cur_image_features.dtype,
+                        )
+                        cur_new_input_embeds.append(budget_query_embed)
+                        cur_new_input_embeds.append(path_query_embed)
+                        cur_new_labels.append(
+                            torch.full((1,), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype)
+                        )
+                        cur_new_labels.append(
+                            torch.full((1,), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype)
+                        )
+                        cur_new_input_ids.append(
+                            torch.full(
+                                (1,),
+                                ADALAVA_BUDGET_TOKEN_INDEX,
+                                device=cur_input_ids.device,
+                                dtype=cur_input_ids.dtype,
+                            )
+                        )
+                        cur_new_input_ids.append(
+                            torch.full(
+                                (1,),
+                                ADALAVA_PATH_TOKEN_INDEX,
+                                device=cur_input_ids.device,
+                                dtype=cur_input_ids.dtype,
+                            )
+                        )
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
             cur_new_input_ids = torch.cat(cur_new_input_ids)

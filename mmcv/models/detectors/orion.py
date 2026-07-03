@@ -31,6 +31,7 @@ from ...datasets.data_utils.constants import IGNORE_INDEX, EGO_WAYPOINT_TOKEN
 from mmcv.models import builder
 
 from ...utils.llava_llama import LlavaLlamaForCausalLM, add_special_token
+from ...utils.adalava_assigner import OrionBudgetAssigner
 from transformers import AutoTokenizer, GenerationConfig
 
 from mmcv.utils.misc import load_model
@@ -87,6 +88,7 @@ class Orion(MVXTwoStageDetector):
                  img_rpn_head=None,
                  lm_head=None,
                  tokenizer=None,
+                 adaption_cfg=None,
                  train_cfg=None,
                  test_cfg=None,
                  stride=16,
@@ -191,9 +193,38 @@ class Orion(MVXTwoStageDetector):
         
         use_critical_qa = use_critical_qa or qa_pretrain
         self.qa_pretrain = qa_pretrain
+        if adaption_cfg is None:
+            adaption_cfg = dict(enabled=False)
+        else:
+            adaption_cfg = copy.deepcopy(adaption_cfg)
+        self.adaption_cfg = adaption_cfg
+        self.adaption_assigner = None
+        self.adaption_enabled = bool(self.adaption_cfg.get('enabled', False))
+        self.adaption_num_prefix_layers = self.adaption_cfg.get('num_prefix_layers', None)
+        self.adaption_budget_candidates = self.adaption_cfg.get('budget_candidates', None)
+        if self.adaption_enabled:
+            if lm_head is None:
+                raise ValueError("lm_head must be set when adaption is enabled")
+            if self.adaption_num_prefix_layers is None:
+                raise ValueError("adaption_cfg.num_prefix_layers must be set when adaption is enabled")
+            if not self.adaption_budget_candidates:
+                raise ValueError("adaption_cfg.budget_candidates must not be empty when adaption is enabled")
         if lm_head is not None:
-            lm_kwargs = dict(use_gen_token=use_gen_token,use_critical_qa=use_critical_qa)
+            lm_kwargs = dict(
+                use_gen_token=use_gen_token,
+                use_critical_qa=use_critical_qa,
+                adalava_enabled=self.adaption_enabled,
+                num_prefix_layers=self.adaption_num_prefix_layers,
+            )
             self.lm_head = load_model(lm_head, use_lora, frozen, lm_kwargs, fp16_infer)
+            if self.adaption_enabled:
+                # 关键调用点：assigner 只依赖 LLM 结构信息，避免把内部对齐参数暴露到外部 config。
+                self.adaption_assigner = OrionBudgetAssigner(
+                    hidden_size=self.lm_head.config.hidden_size,
+                    num_hidden_layers=self.lm_head.config.num_hidden_layers,
+                    num_prefix_layers=self.adaption_num_prefix_layers,
+                    budget_candidates=self.adaption_budget_candidates,
+                )
         if use_gen_token:
             add_special_token([EGO_WAYPOINT_TOKEN], tokenizer = self.tokenizer, model = self.lm_head)
             self.lm_head.config.waypoint_token_idx = self.tokenizer(EGO_WAYPOINT_TOKEN, add_special_tokens=False).input_ids[0]
@@ -563,7 +594,15 @@ class Orion(MVXTwoStageDetector):
         if self.with_lm_head:
             if self.use_gen_token:
                 vision_embeded = torch.cat([vision_embeded_obj, vision_embeded_map], dim=1) # (1, 513, 4096)
-                vlm_loss, ego_feature = self.lm_head(input_ids=input_ids, attention_mask=vlm_attn_mask, labels=vlm_labels, images=vision_embeded, use_cache=False, return_ego_feature=True)
+                vlm_loss, ego_feature = self.lm_head(
+                    input_ids=input_ids,
+                    attention_mask=vlm_attn_mask,
+                    labels=vlm_labels,
+                    images=vision_embeded,
+                    use_cache=False,
+                    return_ego_feature=True,
+                    adalava_controller=self.adaption_assigner,
+                )
                 if self.mix_qa_training:
                     dummy_ego_feature = self.lm_head.get_model().embed_tokens(torch.tensor([[self.lm_head.config.waypoint_token_idx] for _ in range(B)]).cuda())
                     dummy_ego_feature = dummy_ego_feature.squeeze(1)
@@ -682,7 +721,14 @@ class Orion(MVXTwoStageDetector):
             else:
                 waypoint = None
                 vision_embeded = torch.cat([vision_embeded_obj, vision_embeded_map], dim=1) # (1, 513, 4096)
-                vlm_loss= self.lm_head(input_ids=input_ids, attention_mask=vlm_attn_mask, labels=vlm_labels, images=vision_embeded, use_cache=False)
+                vlm_loss = self.lm_head(
+                    input_ids=input_ids,
+                    attention_mask=vlm_attn_mask,
+                    labels=vlm_labels,
+                    images=vision_embeded,
+                    use_cache=False,
+                    adalava_controller=self.adaption_assigner,
+                )
                 losses.update(vlm_loss=vlm_loss[0])
         return losses
     
@@ -795,7 +841,8 @@ class Orion(MVXTwoStageDetector):
                         num_beams=1,
                         max_new_tokens=320,
                         use_cache=True,
-                        return_ego_feature=True
+                        return_ego_feature=True,
+                        adalava_controller=self.adaption_assigner,
                     )
                     ego_feature = ego_feature.to(torch.float32)
                     current_states = ego_feature.unsqueeze(1)
