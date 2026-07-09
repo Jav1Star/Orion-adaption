@@ -32,7 +32,14 @@ from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn
 
-from .adalava_assigner import ADALAVA_BUDGET_TOKEN_INDEX, ADALAVA_PATH_TOKEN_INDEX
+from .adalava_assigner import (
+    ADALAVA_BUDGET_TOKEN_INDEX,
+    ADALAVA_PATH_TOKEN_INDEX,
+    ADALAVA_SCENEAWARE_DET_TOKEN_INDEX,
+    ADALAVA_SCENEAWARE_MAP_TOKEN_INDEX,
+    ADALAVA_SCENEAWARE_TRAJ_TOKEN_INDEX,
+    ADALAVA_SCENEAWARE_VISUAL_TOKEN_INDEX,
+)
 
 class LlavaMetaModel:
 
@@ -146,6 +153,33 @@ class LlavaMetaForCausalLM(ABC):
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
                     cur_new_input_ids.append(torch.full((cur_image_features.shape[0],), IMAGE_TOKEN_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
                     if adalava_controller is not None:
+                        if adalava_controller.sceneaware_enabled:
+                            # 关键调用点：stage1 训练与闭环推理共用 scene-aware token 注入顺序。
+                            sceneaware_embeds = adalava_controller.get_sceneaware_embeddings(
+                                cur_image_features.unsqueeze(0),
+                                sample_idx=batch_idx,
+                            ).squeeze(0)
+                            cur_new_input_embeds.append(sceneaware_embeds)
+                            cur_new_labels.append(
+                                torch.full(
+                                    (sceneaware_embeds.shape[0],),
+                                    IGNORE_INDEX,
+                                    device=cur_labels.device,
+                                    dtype=cur_labels.dtype,
+                                )
+                            )
+                            cur_new_input_ids.append(
+                                torch.tensor(
+                                    [
+                                        ADALAVA_SCENEAWARE_VISUAL_TOKEN_INDEX,
+                                        ADALAVA_SCENEAWARE_DET_TOKEN_INDEX,
+                                        ADALAVA_SCENEAWARE_MAP_TOKEN_INDEX,
+                                        ADALAVA_SCENEAWARE_TRAJ_TOKEN_INDEX,
+                                    ],
+                                    device=cur_input_ids.device,
+                                    dtype=cur_input_ids.dtype,
+                                )
+                            )
                         # 关键调用点：query token 作为内部 embedding 插入，不要求外部 prompt 显式携带特殊 token。
                         budget_query_embed, path_query_embed = adalava_controller.get_query_embeddings(
                             device=cur_image_features.device,
