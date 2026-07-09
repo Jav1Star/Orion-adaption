@@ -194,6 +194,7 @@ num_iters_per_epoch = 234769 // (num_gpus * batch_size)
 num_epochs = 6
 use_gen_token = True
 use_col_loss = True
+orion_adaption_cfg = dict(orion_adaption_cfg, sceneaware_enabled=True, sceneaware_num_tokens=4)
 collect_keys = ['lidar2img', 'cam_intrinsic', 'timestamp', 'ego_pose', 'ego_pose_inv', 'command']
 # pretrain = True
 

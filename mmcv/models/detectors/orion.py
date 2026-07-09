@@ -202,6 +202,14 @@ class Orion(MVXTwoStageDetector):
         self.adaption_enabled = bool(self.adaption_cfg.get('enabled', False))
         self.adaption_num_prefix_layers = self.adaption_cfg.get('num_prefix_layers', None)
         self.adaption_budget_candidates = self.adaption_cfg.get('budget_candidates', None)
+        self.adaption_sceneaware_enabled = bool(self.adaption_cfg.get('sceneaware_enabled', False))
+        self.adaption_sceneaware_num_tokens = int(self.adaption_cfg.get('sceneaware_num_tokens', 0))
+        self.adaption_stage1_enable_prev_frame = bool(self.adaption_cfg.get('stage1_enable_prev_frame', False))
+        self.adaption_stage1_use_sceneaware = bool(self.adaption_cfg.get('stage1_use_sceneaware', False))
+        self.adaption_stage1_loss_mode = self.adaption_cfg.get('stage1_loss_mode', None)
+        self.adaption_stage1_driving_language_only = (
+            self.adaption_stage1_loss_mode == 'driving_language_only'
+        )
         if self.adaption_enabled:
             if lm_head is None:
                 raise ValueError("lm_head must be set when adaption is enabled")
@@ -225,6 +233,15 @@ class Orion(MVXTwoStageDetector):
                     num_prefix_layers=self.adaption_num_prefix_layers,
                     budget_candidates=self.adaption_budget_candidates,
                 )
+                if self.adaption_sceneaware_enabled:
+                    if not self.with_map_head:
+                        raise ValueError("scene-aware requires map_head in Orion closed-loop inference")
+                    # 关键调用点：scene-aware 的历史状态与编码网络都归 assigner 统一管理。
+                    self.adaption_assigner.init_sceneaware_modules(
+                        sceneaware_cfg=self.adaption_cfg,
+                        det_num_classes=self.pts_bbox_head.num_classes,
+                        map_num_classes=self.map_head.num_classes,
+                    )
         if use_gen_token:
             add_special_token([EGO_WAYPOINT_TOKEN], tokenizer = self.tokenizer, model = self.lm_head)
             self.lm_head.config.waypoint_token_idx = self.tokenizer(EGO_WAYPOINT_TOKEN, add_special_tokens=False).input_ids[0]
@@ -345,6 +362,9 @@ class Orion(MVXTwoStageDetector):
 
         self.freeze_backbone = freeze_backbone
         self.temporal_prompt_input = temporal_prompt_input
+        if self.adaption_stage1_driving_language_only:
+            # 关键调用点：stage1 训练参数白名单由 Orion 统一收敛，避免分散到各 head / dataset。
+            self._configure_adaption_stage1_trainable_parameters()
 
     @property
     def with_map_head(self):
@@ -357,6 +377,214 @@ class Orion(MVXTwoStageDetector):
         """bool: Whether the detector has a lm head."""
         return hasattr(self,
                        'lm_head') and self.lm_head is not None
+
+    def _configure_adaption_stage1_trainable_parameters(self):
+        if not self.adaption_enabled or not self.with_lm_head:
+            return
+
+        for param in self.parameters():
+            param.requires_grad = False
+
+        for module in [self.adaption_assigner.budget_encoder, self.adaption_assigner.path_scheduler]:
+            for param in module.parameters():
+                param.requires_grad = True
+
+        if self.adaption_sceneaware_enabled:
+            sceneaware_modules = [
+                self.adaption_assigner.visual_pair_mlp,
+                self.adaption_assigner.det_class_embed,
+                self.adaption_assigner.map_class_embed,
+                self.adaption_assigner.det_item_mlp,
+                self.adaption_assigner.map_item_mlp,
+                self.adaption_assigner.traj_mlp,
+            ]
+            for module in sceneaware_modules:
+                for param in module.parameters():
+                    param.requires_grad = True
+
+        for name, param in self.lm_head.named_parameters():
+            if 'lora_' not in name:
+                continue
+            match = re.search(r'\.layers\.(\d+)\.', name)
+            if match is None:
+                continue
+            layer_idx = int(match.group(1))
+            if layer_idx < int(self.adaption_num_prefix_layers):
+                param.requires_grad = True
+
+    def _unwrap_batched_img_metas(self, img_metas):
+        return [img_meta[0] if isinstance(img_meta, (list, tuple)) else img_meta for img_meta in img_metas]
+
+    def _stack_meta_tensor(self, img_metas, key, device, dtype=torch.float32):
+        meta_tensors = []
+        for meta in img_metas:
+            value = meta[key]
+            if isinstance(value, torch.Tensor):
+                tensor = value.detach().to(device=device, dtype=dtype)
+            else:
+                tensor = torch.as_tensor(np.asarray(value), device=device, dtype=dtype)
+            meta_tensors.append(tensor)
+        return torch.stack(meta_tensors, dim=0)
+
+    def _build_prev_forward_data(self, prev_img_metas, prev_img_feats, device):
+        return dict(
+            img_feats=prev_img_feats,
+            lidar2img=self._stack_meta_tensor(prev_img_metas, 'lidar2img', device=device),
+            cam_intrinsic=self._stack_meta_tensor(prev_img_metas, 'cam_intrinsic', device=device),
+            timestamp=self._stack_meta_tensor(prev_img_metas, 'timestamp', device=device),
+            ego_pose=self._stack_meta_tensor(prev_img_metas, 'ego_pose', device=device),
+            ego_pose_inv=self._stack_meta_tensor(prev_img_metas, 'ego_pose_inv', device=device),
+            can_bus=self._stack_meta_tensor(prev_img_metas, 'can_bus', device=device),
+            command=self._stack_meta_tensor(prev_img_metas, 'command', device=device),
+        )
+
+    def _snapshot_head_memory(self, module):
+        snapshot = {}
+        for attr_name in [
+            'memory_embedding',
+            'memory_reference_point',
+            'memory_timestamp',
+            'memory_egopose',
+            'memory_velo',
+            'memory_canbus',
+            'memory_mask',
+            'memory_scene_tokens',
+            'memory_scene_query',
+            'scene_memory_timestamp',
+            'his_memory_canbus_len',
+        ]:
+            if not hasattr(module, attr_name):
+                continue
+            value = getattr(module, attr_name)
+            if torch.is_tensor(value):
+                snapshot[attr_name] = value.clone()
+            elif isinstance(value, list):
+                snapshot[attr_name] = list(value)
+            else:
+                snapshot[attr_name] = value
+        return snapshot
+
+    def _restore_head_memory(self, module, snapshot):
+        for attr_name, value in snapshot.items():
+            setattr(module, attr_name, value)
+
+    def _build_sceneaware_state_from_prev_sample(
+        self,
+        prev_visual_summary,
+        prev_gt_bboxes_3d,
+        prev_gt_labels_3d,
+        prev_map_gt_bboxes_3d,
+        prev_map_gt_labels_3d,
+        prev_ego_fut_trajs,
+        has_prev_frame,
+    ):
+        if not has_prev_frame:
+            return dict(
+                prev_visual_summary=None,
+                prev_det_boxes=None,
+                prev_det_scores=None,
+                prev_det_labels=None,
+                prev_map_pts=None,
+                prev_map_scores=None,
+                prev_map_labels=None,
+                prev_ego_fut_preds=None,
+            )
+
+        det_labels = prev_gt_labels_3d.detach().to(dtype=torch.long).cpu()
+        map_labels = prev_map_gt_labels_3d.detach().to(dtype=torch.long).cpu()
+        map_points = prev_map_gt_bboxes_3d.fixed_num_sampled_points.detach().to(dtype=torch.float32).cpu()
+        if map_points.shape[-1] == 2:
+            map_points = F.pad(map_points, (0, 1))
+        ego_fut_preds = prev_ego_fut_trajs.detach().to(dtype=torch.float32).cpu()
+        if ego_fut_preds.ndim == 3:
+            ego_fut_preds = ego_fut_preds[0]
+        return dict(
+            prev_visual_summary=prev_visual_summary,
+            prev_det_boxes=prev_gt_bboxes_3d.tensor.detach().to(dtype=torch.float32).cpu(),
+            prev_det_scores=torch.ones(det_labels.shape[0], dtype=torch.float32),
+            prev_det_labels=det_labels,
+            prev_map_pts=map_points,
+            prev_map_scores=torch.ones(map_labels.shape[0], dtype=torch.float32),
+            prev_map_labels=map_labels,
+            prev_ego_fut_preds=ego_fut_preds,
+        )
+
+    def _prepare_stage1_sceneaware_batch(
+        self,
+        prev_img,
+        prev_img_metas,
+        prev_gt_bboxes_3d,
+        prev_gt_labels_3d,
+        prev_map_gt_bboxes_3d,
+        prev_map_gt_labels_3d,
+        prev_ego_fut_trajs,
+        has_prev_frame,
+    ):
+        if not self.adaption_sceneaware_enabled:
+            return
+        has_prev_frame = has_prev_frame.reshape(-1).to(dtype=torch.bool)
+        if not has_prev_frame.any():
+            empty_states = [
+                self._build_sceneaware_state_from_prev_sample(
+                    prev_visual_summary=None,
+                    prev_gt_bboxes_3d=prev_gt_bboxes_3d[idx],
+                    prev_gt_labels_3d=prev_gt_labels_3d[idx],
+                    prev_map_gt_bboxes_3d=prev_map_gt_bboxes_3d[idx],
+                    prev_map_gt_labels_3d=prev_map_gt_labels_3d[idx],
+                    prev_ego_fut_trajs=prev_ego_fut_trajs[idx],
+                    has_prev_frame=False,
+                )
+                for idx in range(len(prev_gt_bboxes_3d))
+            ]
+            self.adaption_assigner.prepare_sceneaware_batch(empty_states)
+            return
+
+        prev_img_metas = self._unwrap_batched_img_metas(prev_img_metas)
+        pts_snapshot = self._snapshot_head_memory(self.pts_bbox_head) if self.with_pts_bbox else None
+        map_snapshot = self._snapshot_head_memory(self.map_head) if self.with_map_head else None
+        try:
+            with torch.no_grad():
+                prev_img_feats = self.extract_feat(prev_img)
+                prev_forward_data = self._build_prev_forward_data(
+                    prev_img_metas=prev_img_metas,
+                    prev_img_feats=prev_img_feats,
+                    device=prev_img.device,
+                )
+                prev_location = self.prepare_location(prev_img_metas, **prev_forward_data)
+                prev_pos_embed = self.position_embeding(prev_forward_data, prev_location, prev_img_metas)
+                prev_visual_tokens = []
+                if self.with_pts_bbox:
+                    _, prev_det_query = self.pts_bbox_head(prev_img_metas, prev_pos_embed, **prev_forward_data)
+                    prev_visual_tokens.append(prev_det_query)
+                if self.with_map_head:
+                    _, prev_map_query = self.map_head(prev_img_metas, prev_pos_embed, **prev_forward_data)
+                    prev_visual_tokens.append(prev_map_query)
+                prev_visual_tokens = torch.cat(prev_visual_tokens, dim=1)
+                prev_visual_summaries = prev_visual_tokens.mean(dim=1, keepdim=True).detach().to(
+                    dtype=torch.float32
+                ).cpu()
+        finally:
+            if self.with_pts_bbox:
+                self._restore_head_memory(self.pts_bbox_head, pts_snapshot)
+            if self.with_map_head:
+                self._restore_head_memory(self.map_head, map_snapshot)
+
+        sceneaware_batch_states = []
+        for batch_idx in range(len(prev_gt_bboxes_3d)):
+            sceneaware_batch_states.append(
+                self._build_sceneaware_state_from_prev_sample(
+                    prev_visual_summary=prev_visual_summaries[batch_idx:batch_idx + 1]
+                    if bool(has_prev_frame[batch_idx].item())
+                    else None,
+                    prev_gt_bboxes_3d=prev_gt_bboxes_3d[batch_idx],
+                    prev_gt_labels_3d=prev_gt_labels_3d[batch_idx],
+                    prev_map_gt_bboxes_3d=prev_map_gt_bboxes_3d[batch_idx],
+                    prev_map_gt_labels_3d=prev_map_gt_labels_3d[batch_idx],
+                    prev_ego_fut_trajs=prev_ego_fut_trajs[batch_idx],
+                    has_prev_frame=bool(has_prev_frame[batch_idx].item()),
+                )
+            )
+        self.adaption_assigner.prepare_sceneaware_batch(sceneaware_batch_states)
         
     # @auto_fp16(apply_to=('img'), out_fp32=True)
     def extract_img_feat(self, img):
@@ -561,37 +789,52 @@ class Orion(MVXTwoStageDetector):
         location = self.prepare_location(img_metas, **data) # (6, 40, 40, 2)
         pos_embed = self.position_embeding(data, location, img_metas) # (1, 9600, 256)
         losses = dict()
+        agent_outs = None
 
         if self.with_pts_bbox:
             outs_bbox, det_query = self.pts_bbox_head(img_metas, pos_embed, **data) # (1, 257, 4096)
             vision_embeded_obj = det_query.clone()
-            loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs_bbox, gt_attr_labels]
-            if self.pts_bbox_head.pred_traffic_light_state:
-                loss_inputs.append(data['traffic_state'])
-                loss_inputs.append(data['traffic_state_mask'])
-            if self.use_col_loss:
-                loss, agent_outs = self.pts_bbox_head.loss(*loss_inputs)
-            else:
-                loss = self.pts_bbox_head.loss(*loss_inputs)
-            losses.update(loss)
+            if self.use_col_loss or not self.adaption_stage1_driving_language_only:
+                loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs_bbox, gt_attr_labels]
+                if self.pts_bbox_head.pred_traffic_light_state:
+                    loss_inputs.append(data['traffic_state'])
+                    loss_inputs.append(data['traffic_state_mask'])
+                if self.use_col_loss:
+                    loss, agent_outs = self.pts_bbox_head.loss(*loss_inputs)
+                else:
+                    loss = self.pts_bbox_head.loss(*loss_inputs)
+                if not self.adaption_stage1_driving_language_only:
+                    losses.update(loss)
             
         if self.with_map_head:
             outs_lane, map_query = self.map_head(img_metas, pos_embed, **data)
             vision_embeded_map = map_query.clone()
-            # reference vad trans
-            device = gt_labels_3d[0].device
-            map_gt_vecs_list = copy.deepcopy(map_gt_bboxes_3d)
-            lane_pts = [F.pad(map_gt_bboxes.fixed_num_sampled_points.to(device),(0,1)) for map_gt_bboxes in map_gt_vecs_list]
-            loss_inputs = [lane_pts, map_gt_labels_3d, outs_lane, img_metas]
+            if not self.adaption_stage1_driving_language_only:
+                # reference vad trans
+                device = gt_labels_3d[0].device
+                map_gt_vecs_list = copy.deepcopy(map_gt_bboxes_3d)
+                lane_pts = [F.pad(map_gt_bboxes.fixed_num_sampled_points.to(device),(0,1)) for map_gt_bboxes in map_gt_vecs_list]
+                loss_inputs = [lane_pts, map_gt_labels_3d, outs_lane, img_metas]
 
-            if False:
-                # for debug
-                import pickle
-                with open('lane_pts.pkl', 'wb') as file:
-                    pickle.dump(lane_pts, file)
-            losses.update(self.map_head.loss(*loss_inputs))
+                if False:
+                    # for debug
+                    import pickle
+                    with open('lane_pts.pkl', 'wb') as file:
+                        pickle.dump(lane_pts, file)
+                losses.update(self.map_head.loss(*loss_inputs))
 
         if self.with_lm_head:
+            if self.adaption_stage1_enable_prev_frame and self.adaption_stage1_use_sceneaware:
+                self._prepare_stage1_sceneaware_batch(
+                    prev_img=data['prev_img'],
+                    prev_img_metas=data['prev_img_metas'],
+                    prev_gt_bboxes_3d=data['prev_gt_bboxes_3d'],
+                    prev_gt_labels_3d=data['prev_gt_labels_3d'],
+                    prev_map_gt_bboxes_3d=data['prev_map_gt_bboxes_3d'],
+                    prev_map_gt_labels_3d=data['prev_map_gt_labels_3d'],
+                    prev_ego_fut_trajs=data['prev_ego_fut_trajs'],
+                    has_prev_frame=data['has_prev_frame'],
+                )
             if self.use_gen_token:
                 vision_embeded = torch.cat([vision_embeded_obj, vision_embeded_map], dim=1) # (1, 513, 4096)
                 vlm_loss, ego_feature = self.lm_head(
@@ -738,6 +981,9 @@ class Orion(MVXTwoStageDetector):
                 self.pts_bbox_head.reset_memory()
             if self.with_map_head:
                 self.map_head.reset_memory()
+            if self.adaption_assigner is not None and self.adaption_sceneaware_enabled:
+                # 关键调用点：新 route 开始时同步清空 scene-aware 历史，避免跨 route 串状态。
+                self.adaption_assigner.reset_sceneaware_history()
             self.test_flag = True
         for var, name in [(img_metas, 'img_metas')]:
             if not isinstance(var, list):
@@ -1018,6 +1264,21 @@ class Orion(MVXTwoStageDetector):
                 lane_results[0]['ego_fut_preds'] = torch.zeros((6, 2), dtype=torch.float32).to(location.device)
                 lane_results[0]['ego_fut_cmd'] = data['ego_fut_cmd']
                 lane_results[0]['fut_valid_flag'] = fut_valid_flag if not self.qa_pretrain else False
+
+        if (
+            self.adaption_assigner is not None
+            and self.adaption_sceneaware_enabled
+            and len(bbox_results) > 0
+            and lane_results is not None
+            and 'ego_fut_preds' in lane_results[0]
+        ):
+            # 关键调用点：在本帧最终解码后写入历史，供下一帧 scene-aware 直接取用。
+            self.adaption_assigner.update_sceneaware_history(
+                bbox_result=bbox_results[0],
+                lane_result=lane_results[0],
+                ego_fut_pred=lane_results[0]['ego_fut_preds'],
+                current_vision_tokens=vision_embeded.detach(),
+            )
 
         return bbox_results, generated_text, lane_results, metric_dict
     

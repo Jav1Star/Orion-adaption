@@ -3,37 +3,8 @@ _base_ = ["../_base_/datasets/nus-3d.py",
           "./orion-adaption.py"]
 backbone_norm_cfg = dict(type='LN', requires_grad=True)
 
-
-def _detect_flash_attn_support():
-    try:
-        torch_mod = __import__('torch')
-    except Exception as exc:
-        print(f"[orion config] Failed to import torch, disable flash_attn: {exc}")
-        return False
-
-    if not torch_mod.cuda.is_available():
-        print("[orion config] CUDA is unavailable, disable flash_attn.")
-        return False
-
-    try:
-        device_index = torch_mod.cuda.current_device()
-        device_name = torch_mod.cuda.get_device_name(device_index)
-        major, minor = torch_mod.cuda.get_device_capability(device_index)
-    except Exception as exc:
-        print(f"[orion config] Failed to inspect CUDA device, disable flash_attn: {exc}")
-        return False
-
-    use_flash_attn = major >= 8
-    status = "enable" if use_flash_attn else "disable"
-    print(
-        f"[orion config] Detected GPU {device_name} "
-        f"(compute capability {major}.{minor}), {status} flash_attn."
-    )
-    return use_flash_attn
-
-
-use_flash_attn = _detect_flash_attn_support()
-del _detect_flash_attn_support
+# plugin=True
+# plugin_dir='projects/mmdet3d_plugin/'
 
 # If point cloud range is changed, the models should also change their point
 # cloud range accordingly
@@ -186,18 +157,33 @@ eval_cfg = {
             "class_range":{'car':(50,50),'van':(50,50),'truck':(50,50),'bicycle':(40,40),'traffic_sign':(30,30),'traffic_cone':(30,30),'traffic_light':(30,30),'pedestrian':(40,40)}
             }
 
+queue_length = 1  # each sequence contains `queue_length` frames.
+### traj prediction args ###
+predict_steps = 12
+predict_modes = 6
+fut_steps = 4
+past_steps = 4
+use_nonlinear_optimizer = True
 use_memory = True
-fp32_infer=True
-num_gpus = 32
-batch_size = 4
-num_iters_per_epoch = 234769 // (num_gpus * batch_size)
+num_gpus = 1
+batch_size = 2
+num_iters_per_epoch = 2295 // (num_gpus * batch_size)
 num_epochs = 6
 use_gen_token = True
-use_col_loss = True
-orion_adaption_cfg = dict(orion_adaption_cfg, sceneaware_enabled=True, sceneaware_num_tokens=4)
+use_col_loss = False
 collect_keys = ['lidar2img', 'cam_intrinsic', 'timestamp', 'ego_pose', 'ego_pose_inv', 'command']
 # pretrain = True
-
+mix_qa_training =True
+chat_b2d_train_root = '/dataset/bench2drive/chat-B2D/train'
+chat_b2d_val_root = '/dataset/bench2drive/chat-B2D/train'
+orion_adaption_cfg = dict(
+    orion_adaption_cfg,
+    sceneaware_enabled=True,
+    sceneaware_num_tokens=4,
+    stage1_enable_prev_frame=True,
+    stage1_use_sceneaware=True,
+    stage1_loss_mode='driving_language_only',
+)
 input_modality = dict(
     use_lidar=False,
     use_camera=True,
@@ -209,7 +195,6 @@ model = dict(
     type='Orion',
     save_path='./results_planning_only/',  #save path for vlm models.
     use_grid_mask=True,
-    fp32_infer=fp32_infer,
     frozen=False,
     use_lora=True,
     tokenizer=llm_path,
@@ -217,6 +202,12 @@ model = dict(
     adaption_cfg=orion_adaption_cfg,
     use_gen_token = use_gen_token,
     use_diff_decoder = False, 
+    use_col_loss = use_col_loss,
+    loss_plan_reg=dict(type='L1Loss', loss_weight=3.0),
+    loss_plan_bound=dict(type='PlanMapBoundLoss', loss_weight=3.0, dis_thresh=1.0),
+    loss_plan_col=dict(type='PlanCollisionLoss', loss_weight=1.0),
+    loss_vae_gen=dict(type='ProbabilisticLoss', loss_weight=3.0),
+    mix_qa_training=mix_qa_training,
     img_backbone=dict(
         type='EVAViT',
         img_size=640, 
@@ -228,11 +219,11 @@ model = dict(
         num_heads=16,
         mlp_ratio=4*2/3,
         window_block_indexes = (
-            list(range(0, 2)) + list(range(3, 5)) + list(range(6, 8)) + list(range(9, 11)) + list(range(12, 14)) + list(range(15, 17)) + list(range(18, 20)) + list(range(21, 23))
+        list(range(0, 2)) + list(range(3, 5)) + list(range(6, 8)) + list(range(9, 11)) + list(range(12, 14)) + list(range(15, 17)) + list(range(18, 20)) + list(range(21, 23))
         ),
         qkv_bias=True,
         drop_path_rate=0.3,
-        flash_attn=use_flash_attn,
+        flash_attn=True,
         with_cp=True, 
         frozen=False,), 
     map_head=dict(
@@ -262,7 +253,21 @@ model = dict(
                  feedforward_dims=2048,
                  dropout=0.1,
                  with_cp=True,
-                 flash_attn=use_flash_attn,)), #
+                 flash_attn=True,),
+        train_cfg=dict(
+                assigner=dict(
+                    type='LaneHungarianAssigner',
+                    cls_cost=dict(type='FocalLossCost', weight=1.5),
+                    reg_cost=dict(type='LaneL1Cost', weight=0.02),
+                    iou_cost=dict(type='IoUCost', weight=0.0))), # dummy
+        loss_cls=dict(
+            type='FocalLoss',
+            use_sigmoid=True,
+            gamma=2.0,
+            alpha=0.25,
+            loss_weight=1.5),
+        loss_bbox=dict(type='L1Loss', loss_weight=0.02),
+        loss_dir=dict(type='PtsDirCosLoss', loss_weight=0.0)), #
     pts_bbox_head=dict(
         type='OrionHead',
         num_classes=9,
@@ -292,7 +297,7 @@ model = dict(
             dropout=0.0,
             feedforward_dims=_ffn_dim_,
             with_cp=True,
-            flash_attn=use_flash_attn,
+            flash_attn=True,
             return_intermediate=False,
             ),
         code_weights = [2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
@@ -312,7 +317,7 @@ model = dict(
             dropout=0.0,
             feedforward_dims=_ffn_dim_,
             with_cp=True,
-            flash_attn=use_flash_attn,
+            flash_attn=True,
             return_intermediate=False),
         transformer=dict(
             type='PETRTemporalTransformer',
@@ -324,16 +329,43 @@ model = dict(
                  feedforward_dims=2048,
                  dropout=0.1,
                  with_cp=True,
-                 flash_attn=use_flash_attn,
+                 flash_attn=True,
             ),
         bbox_coder=dict(
             type='CustomNMSFreeCoder',
-            post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],# 检测到的边界框的中心点的范围。
+            post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
             pc_range=point_cloud_range, # 
             max_num=300,
             voxel_size=voxel_size,
-            num_classes=9)),
-)
+            num_classes=9), 
+        loss_cls=dict(
+            type='FocalLoss',
+            use_sigmoid=True,
+            gamma=2.0,
+            alpha=0.25,
+            loss_weight=2.0),
+        loss_traffic=dict(
+            type='FocalLoss',
+            use_sigmoid=True,
+            gamma=2.0,
+            alpha=0.25,
+            loss_weight=2.0),
+        loss_bbox=dict(type='L1Loss', loss_weight=0.25),
+        loss_iou=dict(type='GIoULoss', loss_weight=0.0),),
+        # model training and testing settings
+    train_cfg=dict(pts=dict(
+        grid_size=[512, 512, 1],
+        voxel_size=voxel_size,
+        point_cloud_range=point_cloud_range,
+        out_size_factor=4,
+        assigner=dict(
+            type='HungarianAssigner3D',
+            cls_cost=dict(type='FocalLossCost', weight=2.0),
+            reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
+            iou_cost=dict(type='IoUCost', weight=0.0), # Fake cost. This is just to make it compatible with DETR head. 
+            pc_range=point_cloud_range),)
+            )
+            )
 
 dataset_type = "B2DOrionDataset"
 data_root = "data/bench2drive"
@@ -342,13 +374,43 @@ map_root = "data/bench2drive/maps"
 map_file = "data/infos/b2d_map_infos.pkl"
 
 file_client_args = dict(backend="disk")
+ann_file_train=info_root + f"/b2d_infos_train.pkl"
+ann_file_val=info_root + f"/b2d_infos_val.pkl"
 ann_file_test=info_root + f"/b2d_infos_val.pkl"
+
+train_pipeline = [
+    dict(type="LoadMultiViewImageFromFilesInCeph", to_float32=True),
+    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=True,with_light_state=True),
+    dict(type='VADObjectRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='VADObjectNameFilter', classes=class_names),
+    
+    dict(type='LoadAnnoatationVQA', 
+        base_desc_path=chat_b2d_train_root,
+        tokenizer=llm_path, 
+        max_length=2048, 
+        use_gen_token=use_gen_token,
+        planning_qa_ratio=0.8,
+        mix_qa_training=mix_qa_training,
+        ),
+
+    # dict(type='RandomScaleImageMultiViewImage', scales=[0.8]), 保持640
+    # dict(type='ResizeMultiview3D', img_scale=(640, 640), keep_ratio=False, multiscale_mode='value'),
+    dict(type='ResizeCropFlipRotImage', data_aug_conf = ida_aug_conf, training=False),
+    dict(type='ResizeMultiview3D', img_scale=(640, 640), keep_ratio=False, multiscale_mode='value'),
+    dict(type="PadMultiViewImage", size_divisor=32),
+    dict(type="NormalizeMultiviewImage", **img_norm_cfg),
+    dict(type="PETRFormatBundle3D", class_names=class_names, collect_keys = collect_keys),
+    dict(type='CustomCollect3D',\
+         keys=['gt_bboxes_3d', 'gt_labels_3d', 'img', 'ego_his_trajs','input_ids','gt_attr_labels', 'ego_fut_trajs', 'ego_fut_masks','ego_fut_cmd', 'ego_lcf_feat','vlm_labels','can_bus', 'traffic_state_mask', 'traffic_state']+collect_keys),
+]
 
 test_pipeline = [
     dict(type='LoadMultiViewImageFromFilesInCeph', to_float32=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=True),
-    dict(type='VADObjectRangeFilter', point_cloud_range=point_cloud_range),
+        dict(type='VADObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='VADObjectNameFilter', classes=class_names),
+    
+    # dict(type='ResizeMultiview3D', img_scale=(640, 640), keep_ratio=False, multiscale_mode='value'),
     dict(type='ResizeCropFlipRotImage', data_aug_conf = ida_aug_conf, training=False),
     dict(type='ResizeMultiview3D', img_scale=(640, 640), keep_ratio=False, multiscale_mode='value'),
     dict(type="NormalizeMultiviewImage", **img_norm_cfg),
@@ -357,38 +419,7 @@ test_pipeline = [
          load_type=["critical_qa"],
          tokenizer=llm_path, 
          use_gen_token=use_gen_token,
-         max_length=2048,
-         desc_qa=False),
-    dict(
-        type='MultiScaleFlipAug3D',
-        img_scale=(1333, 800),
-        pts_scale_ratio=1,
-        flip=False,
-        transforms=[
-            dict(
-                type='PETRFormatBundle3D',
-                collect_keys=collect_keys,
-                class_names=class_names,
-                with_label=False),
-            dict(
-                type='CustomCollect3D',\
-                keys=['gt_bboxes_3d', 'gt_labels_3d', 'img', 'ego_his_trajs','input_ids','gt_attr_labels', 'ego_fut_trajs', 'ego_fut_masks','ego_fut_cmd', 'ego_lcf_feat','vlm_labels','can_bus','fut_valid_flag']+collect_keys,
-            )]
-    )
-]
-
-inference_only_pipeline = [
-    dict(type='LoadMultiViewImageFromFilesInCeph', to_float32=True),
-    dict(type='ResizeCropFlipRotImage', data_aug_conf = ida_aug_conf, training=False),
-    dict(type='ResizeMultiview3D', img_scale=(640, 640), keep_ratio=False, multiscale_mode='value'),
-    dict(type="NormalizeMultiviewImage", **img_norm_cfg),
-    dict(type="PadMultiViewImage", size_divisor=32),
-    dict(type='LoadAnnoatationCriticalVQATest', 
-         load_type=["critical_qa"],
-         tokenizer=llm_path, 
-         use_gen_token=use_gen_token,
-         max_length=2048,
-         desc_qa=False),
+         max_length=2048,),
 
     dict(
         type='MultiScaleFlipAug3D',
@@ -402,33 +433,133 @@ inference_only_pipeline = [
                 class_names=class_names,
                 with_label=False),
             dict(type='CustomCollect3D',\
-                keys=['img','input_ids','ego_fut_cmd', 'vlm_labels','can_bus']+collect_keys,
+                keys=['gt_bboxes_3d', 'gt_labels_3d', 'img', 'ego_his_trajs','input_ids','gt_attr_labels', 'ego_fut_trajs', 'ego_fut_masks','ego_fut_cmd', 'ego_lcf_feat','vlm_labels','can_bus','fut_valid_flag']+collect_keys,
                 )]
     )
 ]
 
+inference_only_pipeline = [
+    dict(type='LoadMultiViewImageFromFilesInCeph', to_float32=True,
+            file_client_args=file_client_args, img_root=data_root),
+    dict(type="NormalizeMultiviewImage", **img_norm_cfg),
+    dict(type="PadMultiViewImage", size_divisor=32),
+    dict(
+        type="MultiScaleFlipAug3D",
+        img_scale=(1600, 900),
+        pts_scale_ratio=1,
+        flip=False,
+        transforms=[
+            dict(
+                type="DefaultFormatBundle3D", class_names=class_names, with_label=False
+            ),
+            dict(
+                type="CustomCollect3D", keys=[
+                                            "img",
+                                            "timestamp",
+                                            "l2g_r_mat",
+                                            "l2g_t",
+                                            "command",
+                                        ]
+            ),
+        ],
+    ),
+]
 data = dict(
     samples_per_gpu=batch_size,
     workers_per_gpu=4,
-    test=dict(
+train=dict(
         type=dataset_type,
+        seq_mode=True,
+        seq_split_num=1,
+        stage1_enable_prev_frame=True,
         data_root=data_root,
-        ann_file=ann_file_test,
-        pipeline=test_pipeline,
+        ann_file=ann_file_train,
+        pipeline=train_pipeline,
         classes=class_names,
         name_mapping=NameMapping,
         map_root=map_root,
         map_file=map_file,
         modality=input_modality,
+        queue_length=queue_length,
         past_frames=past_frames,
         future_frames=future_frames,
         point_cloud_range=point_cloud_range,
-        polyline_points_num=map_fixed_ptsnum_per_gt_line,
-        eval_cfg=eval_cfg,
-    ),
+        polyline_points_num=map_fixed_ptsnum_per_gt_line, # 每条线的点的个数
+        # we use box_type_3d='LiDAR' in kitti and nuscenes dataset
+        # and box_type_3d='Depth' in sunrgbd and scannet dataset.
+        box_type_3d='LiDAR',
+        #custom_eval_version='vad_nusc_detection_cvpr_2019'
+        ),
+    val=dict(type=dataset_type,
+            data_root=data_root,
+            ann_file=ann_file_val,
+            pipeline=test_pipeline,
+            classes=class_names,
+            name_mapping=NameMapping,
+            map_root=map_root,
+            map_file=map_file,
+            modality=input_modality,
+            queue_length=queue_length,
+            past_frames=past_frames,
+            future_frames=future_frames,
+            point_cloud_range=point_cloud_range,
+            polyline_points_num=map_fixed_ptsnum_per_gt_line,
+            eval_cfg=eval_cfg
+            ),
+    test=dict(type=dataset_type,
+            data_root=data_root,
+            ann_file=ann_file_val,
+            pipeline=test_pipeline,
+            classes=class_names,
+            name_mapping=NameMapping,
+            map_root=map_root,
+            map_file=map_file,
+            modality=input_modality,
+            queue_length=queue_length,
+            past_frames=past_frames,
+            future_frames=future_frames,
+            point_cloud_range=point_cloud_range,
+            polyline_points_num=map_fixed_ptsnum_per_gt_line,
+            eval_cfg=eval_cfg
+            ),
+    shuffler_sampler=dict(
+        type="InfiniteGroupEachSampleInBatchSampler",
+        seq_split_num=10,
+        warmup_split_num=80, # lane det and vlm need short term temporal fusion in the early stage of training
+        num_iters_to_seq=num_iters_per_epoch,),
     nonshuffler_sampler=dict(type="DistributedSampler"),
-)
+    )
 
+
+optimizer = dict(constructor='LearningRateDecayOptimizerConstructor', type='AdamW', 
+                 lr=8e-5, betas=(0.9, 0.999), weight_decay=1e-5,
+                 paramwise_cfg={'decay_rate': 0.9,
+                                'head_decay_rate': 4.0,
+                                'lm_head_decay_rate': 0.1,
+                                'decay_type': 'vit_wise',
+                                'num_layers': 24,
+                                })
+
+# optimizer_config = dict(loss_scale='dynamic', grad_clip=dict(max_norm=35, norm_type=2))
+# optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
+optimizer_config = dict(type='Fp16OptimizerHook', loss_scale='dynamic', grad_clip=dict(max_norm=35, norm_type=2))
+# learning policy
+lr_config = dict(
+    policy='CosineAnnealing',
+    warmup='linear',
+    warmup_iters=500,
+    warmup_ratio=1.0 / 3,
+    min_lr_ratio=1e-3,
+    )
+
+evaluation = dict(interval=num_iters_per_epoch*(num_epochs+1), pipeline=test_pipeline) # no eval
+find_unused_parameters=False #### when use checkpoint, find_unused_parameters must be False
+checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=3)
+runner = dict(
+    type='IterBasedRunner', max_iters=num_epochs * num_iters_per_epoch)
 log_config = dict(
     interval=10, hooks=[dict(type="TextLoggerHook"), dict(type="TensorboardLoggerHook")]
 )
+
+load_from=None
+resume_from=None
