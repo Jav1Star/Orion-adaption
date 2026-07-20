@@ -52,6 +52,20 @@ def cast_tensor_type(inputs, src_type, dst_type):
         return inputs
 
 
+def _is_amp_enabled(module):
+    return bool(getattr(module, 'amp_enabled', False)
+                or getattr(module, 'fp16_enabled', False))
+
+
+def _get_amp_dtype(module):
+    amp_dtype = getattr(module, 'amp_dtype', None)
+    if amp_dtype is not None:
+        return amp_dtype
+    if getattr(module, 'fp16_enabled', False):
+        return torch.float16
+    return None
+
+
 def auto_fp16(apply_to=None, out_fp32=False):
     """Decorator to enable fp16 training automatically.
 
@@ -89,13 +103,13 @@ def auto_fp16(apply_to=None, out_fp32=False):
 
         @functools.wraps(old_func)
         def new_func(*args, **kwargs):
-            # check if the module has set the attribute `fp16_enabled`, if not,
-            # just fallback to the original method.
+            # 关键调用点：训练入口统一通过模块上的 amp 标记驱动 autocast，避免 fp16/bf16 再各走一套分支。
             if not isinstance(args[0], torch.nn.Module):
                 raise TypeError('@auto_fp16 can only be used to decorate the '
                                 'method of nn.Module')
-            if not (hasattr(args[0], 'fp16_enabled') and args[0].fp16_enabled):
+            if not _is_amp_enabled(args[0]):
                 return old_func(*args, **kwargs)
+            amp_dtype = _get_amp_dtype(args[0]) or torch.float16
 
             # get the arg spec of the decorated method
             args_info = getfullargspec(old_func)
@@ -109,7 +123,7 @@ def auto_fp16(apply_to=None, out_fp32=False):
                 for i, arg_name in enumerate(arg_names):
                     if arg_name in args_to_cast:
                         new_args.append(
-                            cast_tensor_type(args[i], torch.float, torch.half))
+                            cast_tensor_type(args[i], torch.float, amp_dtype))
                     else:
                         new_args.append(args[i])
             # convert the kwargs that need to be processed
@@ -118,12 +132,12 @@ def auto_fp16(apply_to=None, out_fp32=False):
                 for arg_name, arg_value in kwargs.items():
                     if arg_name in args_to_cast:
                         new_kwargs[arg_name] = cast_tensor_type(
-                            arg_value, torch.float, torch.half)
+                            arg_value, torch.float, amp_dtype)
                     else:
                         new_kwargs[arg_name] = arg_value
             # apply converted arguments to the decorated method
             if (digit_version(TORCH_VERSION) >= digit_version('1.6.0')):
-                with autocast(enabled=True):
+                with autocast(enabled=True, dtype=amp_dtype):
                     output = old_func(*new_args, **new_kwargs)
             else:
                 output = old_func(*new_args, **new_kwargs)
@@ -176,12 +190,12 @@ def force_fp32(apply_to=None, out_fp16=False):
 
         @functools.wraps(old_func)
         def new_func(*args, **kwargs):
-            # check if the module has set the attribute `fp16_enabled`, if not,
+            # check if the module has set the amp flag, if not,
             # just fallback to the original method.
             if not isinstance(args[0], torch.nn.Module):
                 raise TypeError('@force_fp32 can only be used to decorate the '
                                 'method of nn.Module')
-            if not (hasattr(args[0], 'fp16_enabled') and args[0].fp16_enabled):
+            if not _is_amp_enabled(args[0]):
                 return old_func(*args, **kwargs)
             # get the arg spec of the decorated method
             args_info = getfullargspec(old_func)
@@ -246,15 +260,30 @@ def wrap_fp16_model(model):
     Args:
         model (nn.Module): Model in FP32.
     """
-    if (digit_version(TORCH_VERSION) < digit_version('1.6.0')):
+    _wrap_amp_model(model, torch.float16)
+
+
+def wrap_bf16_model(model):
+    """Wrap the model to BF16 AMP.
+
+    Args:
+        model (nn.Module): Model in FP32/BF16.
+    """
+    _wrap_amp_model(model, torch.bfloat16)
+
+
+def _wrap_amp_model(model, amp_dtype):
+    if amp_dtype == torch.float16 and (
+            digit_version(TORCH_VERSION) < digit_version('1.6.0')):
         # convert model to fp16
         model.half()
         # patch the normalization layers to make it work in fp32 mode
         patch_norm_fp32(model)
-    # set `fp16_enabled` flag
     for m in model.modules():
         if hasattr(m, 'fp16_enabled'):
-            m.fp16_enabled = True
+            m.fp16_enabled = amp_dtype == torch.float16
+            m.amp_enabled = True
+            m.amp_dtype = amp_dtype
 
 
 def patch_norm_fp32(module):

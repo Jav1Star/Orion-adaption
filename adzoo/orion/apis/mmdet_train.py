@@ -12,10 +12,11 @@ import torch.distributed as dist
 from torch.nn import DataParallel
 from torch.nn.parallel.distributed import DistributedDataParallel
 from mmcv.runner import (HOOKS, DistSamplerSeedHook, EpochBasedRunner,
-                         Fp16OptimizerHook, OptimizerHook,
+                         Fp16OptimizerHook, GradientCumulativeOptimizerHook,
+                         OptimizerHook,
                          build_runner, )
 from mmcv.optims import build_optimizer
-from mmcv.utils import build_from_cfg
+from mmcv.utils import build_from_cfg, wrap_bf16_model
 
 from mmcv.core import EvalHook
 
@@ -36,6 +37,14 @@ def custom_train_detector(model,
                    eval_model=None,
                    meta=None):
     logger = get_root_logger(cfg.log_level)
+    fp16_cfg = cfg.get('fp16', None)
+    bf16_cfg = cfg.get('bf16', None)
+    if fp16_cfg is not None and bf16_cfg is not None and bf16_cfg.get('enabled', True):
+        raise ValueError('fp16 and bf16 cannot be enabled at the same time')
+    if bf16_cfg is not None and not bf16_cfg.get('enabled', True):
+        bf16_cfg = None
+    if bf16_cfg is not None:
+        wrap_bf16_model(model)
     # prepare data loaders
     dataset = dataset if isinstance(dataset, (list, tuple)) else [dataset]
     #assert len(dataset)==1s
@@ -125,11 +134,23 @@ def custom_train_detector(model,
 
     runner.timestamp = timestamp
 
-    # fp16 setting
-    fp16_cfg = cfg.get('fp16', None)
+    # fp16 / bf16 setting
     if fp16_cfg is not None:
         optimizer_config = Fp16OptimizerHook(
             **cfg.optimizer_config, **fp16_cfg, distributed=distributed)
+    elif bf16_cfg is not None:
+        optimizer_hook_cfg = cfg.optimizer_config.copy()
+        optimizer_hook_type = optimizer_hook_cfg.pop('type', None)
+        if optimizer_hook_type in (None, 'OptimizerHook'):
+            optimizer_config = OptimizerHook(**optimizer_hook_cfg)
+        elif optimizer_hook_type == 'GradientCumulativeOptimizerHook':
+            # 关键调用点：bf16 训练与累积梯度并不冲突，这里直接复用 mmcv 的累积梯度 hook。
+            optimizer_config = GradientCumulativeOptimizerHook(**optimizer_hook_cfg)
+        else:
+            raise ValueError(
+                'bf16 training only supports OptimizerHook or '
+                'GradientCumulativeOptimizerHook, '
+                f'got {optimizer_hook_type}')
     elif distributed and 'type' not in cfg.optimizer_config:
         optimizer_config = OptimizerHook(**cfg.optimizer_config)
     else:
@@ -188,4 +209,3 @@ def custom_train_detector(model,
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
     runner.run(data_loaders, cfg.workflow)
-

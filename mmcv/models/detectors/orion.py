@@ -102,6 +102,7 @@ class Orion(MVXTwoStageDetector):
                  fp16_infer=False, # for faster close-loop infer, infer without evaluation
                  fp16_eval=False,
                  fp32_infer=False,  # for infer without evaluation
+                 bf16_train=False,
                  fut_ts=6,
                  freeze_backbone=False,
                  use_col_loss = False,
@@ -196,6 +197,9 @@ class Orion(MVXTwoStageDetector):
         
         use_critical_qa = use_critical_qa or qa_pretrain
         self.qa_pretrain = qa_pretrain
+        self.bf16_train = bool(bf16_train)
+        if self.bf16_train and fp16_infer:
+            raise ValueError("bf16_train is not compatible with fp16_infer")
         if adaption_cfg is None:
             adaption_cfg = dict(enabled=False)
         else:
@@ -239,7 +243,15 @@ class Orion(MVXTwoStageDetector):
                 adalava_enabled=self.adaption_enabled,
                 num_prefix_layers=self.adaption_num_prefix_layers,
             )
-            self.lm_head = load_model(lm_head, use_lora, frozen, lm_kwargs, fp16_infer)
+            llm_frozen_dtype = torch.bfloat16 if self.bf16_train else None
+            self.lm_head = load_model(
+                lm_head,
+                use_lora,
+                frozen,
+                lm_kwargs,
+                fp16_infer,
+                frozen_dtype=llm_frozen_dtype,
+            )
             if self.adaption_enabled:
                 # 关键调用点：assigner 只依赖 LLM 结构信息，避免把内部对齐参数暴露到外部 config。
                 self.adaption_assigner = OrionBudgetAssigner(
@@ -392,6 +404,9 @@ class Orion(MVXTwoStageDetector):
         if self.adaption_stage1_enabled:
             # 关键调用点：stage1 训练参数白名单由 Orion 统一收敛，避免分散到各 head / dataset。
             self._configure_adaption_stage1_trainable_parameters()
+        if self.bf16_train:
+            # 关键调用点：bf16 训练只压缩整棵冻结子树，避免在同一模块内混放 trainable fp32 与 frozen bf16。
+            self._convert_frozen_modules_to_bf16()
 
     @property
     def with_map_head(self):
@@ -439,6 +454,17 @@ class Orion(MVXTwoStageDetector):
             if layer_idx < int(self.adaption_num_prefix_layers):
                 param.requires_grad = True
 
+    def _convert_frozen_modules_to_bf16(self):
+        # 关键调用点：当前仓库里最值得先压缩的是冻结 LLM，本轮先收敛到这一条稳定路径，避免把更多旧模块一起拖进 bf16 边界问题。
+        bf16_module_names = ['lm_head']
+        for module_name in bf16_module_names:
+            module = getattr(self, module_name, None)
+            if module is None:
+                continue
+            if any(param.requires_grad for param in module.parameters()):
+                continue
+            module.to(dtype=torch.bfloat16)
+
     def _stack_meta_tensor(self, img_metas, key, device, dtype=torch.float32, fallback=None):
         if len(img_metas) > 0 and key not in img_metas[0]:
             if fallback is None:
@@ -455,6 +481,23 @@ class Orion(MVXTwoStageDetector):
                 tensor = torch.as_tensor(np.asarray(value), device=device, dtype=dtype)
             meta_tensors.append(tensor)
         return torch.stack(meta_tensors, dim=0)
+
+    def _align_tensor_to_module_dtype(self, tensor, module):
+        if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
+            return tensor
+        target_dtype = None
+        for param in module.parameters():
+            if param.is_floating_point():
+                target_dtype = param.dtype
+                break
+        if target_dtype is None:
+            for buffer in module.buffers():
+                if buffer.is_floating_point():
+                    target_dtype = buffer.dtype
+                    break
+        if target_dtype is None or tensor.dtype == target_dtype:
+            return tensor
+        return tensor.to(dtype=target_dtype)
 
     def _extract_route_keys(self, img_metas):
         return [img_meta.get('scene_token', img_meta.get('folder')) for img_meta in img_metas]
@@ -672,6 +715,8 @@ class Orion(MVXTwoStageDetector):
         coords3d = coords3d.reshape(B, -1, D*3)
       
         pos_embed  = inverse_sigmoid(coords3d)
+        pos_embed = self._align_tensor_to_module_dtype(
+            pos_embed, self.position_encoder)
         coords_position_embeding = self.position_encoder(pos_embed)
 
         return coords_position_embeding
@@ -857,7 +902,7 @@ class Orion(MVXTwoStageDetector):
                 )
                 if self.mix_qa_training:
                     dummy_ego_feature = self.lm_head.get_model().embed_tokens(torch.tensor([[self.lm_head.config.waypoint_token_idx] for _ in range(B)]).cuda())
-                    dummy_ego_feature = dummy_ego_feature.squeeze(1)
+                    dummy_ego_feature = dummy_ego_feature.squeeze(1).to(dtype=ego_feature.dtype)
                     valid_input_mask = (input_ids == self.lm_head.config.waypoint_token_idx).sum(dim=-1).to(torch.bool)
                     dummy_ego_feature[valid_input_mask] = ego_feature
                     ego_feature = dummy_ego_feature
@@ -885,7 +930,9 @@ class Orion(MVXTwoStageDetector):
                         states_hs[:, :, 0, :].unsqueeze(1).permute(0, 2, 1, 3)
                     ego_fut_trajs_list = []
                     for i in range(self.fut_ts):
-                        outputs_ego_trajs = self.ego_fut_decoder(ego_query_hs[i]).reshape(B, self.ego_fut_mode, 2)
+                        ego_query_input = self._align_tensor_to_module_dtype(
+                            ego_query_hs[i], self.ego_fut_decoder)
+                        outputs_ego_trajs = self.ego_fut_decoder(ego_query_input).reshape(B, self.ego_fut_mode, 2)
                         ego_fut_trajs_list.append(outputs_ego_trajs)
 
                     ego_fut_preds = torch.stack(ego_fut_trajs_list, dim=2)
@@ -969,6 +1016,8 @@ class Orion(MVXTwoStageDetector):
                         diff_pose_preds=poses_reg_list[-1],
                     )
                 elif self.use_mlp_decoder:
+                    current_states = self._align_tensor_to_module_dtype(
+                        current_states, self.waypoint_decoder)
                     waypoint = self.waypoint_decoder(current_states)
                     waypoint = waypoint.reshape(-1,2)
                     wp_loss = self.waypoints_loss(waypoint.to(torch.float32), ego_fut_trajs.view(-1, 2).to(torch.float32))
@@ -1167,7 +1216,9 @@ class Orion(MVXTwoStageDetector):
                             states_hs[:, :, 0, :].unsqueeze(1).permute(0, 2, 1, 3)
                         ego_fut_trajs_list = []
                         for i in range(self.fut_ts):
-                            outputs_ego_trajs = self.ego_fut_decoder(ego_query_hs[i]).reshape(B, self.ego_fut_mode, 2)
+                            ego_query_input = self._align_tensor_to_module_dtype(
+                                ego_query_hs[i], self.ego_fut_decoder)
+                            outputs_ego_trajs = self.ego_fut_decoder(ego_query_input).reshape(B, self.ego_fut_mode, 2)
                             ego_fut_trajs_list.append(outputs_ego_trajs)
 
                         ego_fut_preds = torch.stack(ego_fut_trajs_list, dim=2)
@@ -1229,6 +1280,8 @@ class Orion(MVXTwoStageDetector):
                         # best_reg = poses_reg[mode_masks]
                         ego_fut_preds = poses_reg
                     elif self.use_mlp_decoder:
+                        current_states = self._align_tensor_to_module_dtype(
+                            current_states, self.waypoint_decoder)
                         waypoint = self.waypoint_decoder(current_states)
                         waypoint = waypoint.reshape(-1,2)
                 else:
@@ -2015,11 +2068,15 @@ class Orion(MVXTwoStageDetector):
 
         b = present_features.shape[0]
         c = present_features.shape[1]
+        present_features = self._align_tensor_to_module_dtype(
+            present_features, self.present_distribution)
         present_mu, present_log_sigma = self.present_distribution(present_features)
 
         future_mu, future_log_sigma = None, None
         if future_distribution_inputs is not None:
             future_features = torch.cat([present_features, future_distribution_inputs], dim=2)
+            future_features = self._align_tensor_to_module_dtype(
+                future_features, self.future_distribution)
             future_mu, future_log_sigma = self.future_distribution(future_features)
 
         if noise is None:

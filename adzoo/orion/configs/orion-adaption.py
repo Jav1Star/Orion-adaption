@@ -46,9 +46,9 @@ sample_interval = 5
 
 orion_adaption_cfg = dict(
     enabled=True,
-    num_prefix_layers=16,
-    budget_curriculum_start_min=0.9,
-    budget_curriculum_warmup_steps=40000,
+    num_prefix_layers=6,
+    budget_curriculum_start_min=0.8,
+    budget_curriculum_warmup_steps=20000,
     path_gumbel_tau=1.0,
     path_gumbel_hard=True,
     stage1_aux_enabled=False,

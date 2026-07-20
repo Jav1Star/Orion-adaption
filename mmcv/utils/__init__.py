@@ -22,7 +22,8 @@ from .logging import get_logger, print_log
 from .logger import get_root_logger
 from .collect_env import collect_env
 from .runner_utils import *
-from .fp16_utils import LossScaler, auto_fp16, force_fp32, wrap_fp16_model, TORCH_VERSION
+from .fp16_utils import (LossScaler, TORCH_VERSION, auto_fp16, force_fp32,
+                         wrap_bf16_model, wrap_fp16_model)
 from .checkpoint import load_checkpoint, save_checkpoint
 from .log_buffer import LogBuffer
 from .priority import Priority, get_priority

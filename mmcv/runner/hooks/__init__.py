@@ -1,5 +1,9 @@
 from .evaluation import DistEvalHook, EvalHook
-from .optimizer import OptimizerHook, Fp16OptimizerHook
+from .optimizer import (
+    Fp16OptimizerHook,
+    GradientCumulativeOptimizerHook,
+    OptimizerHook,
+)
 from .sampler_seed import DistSamplerSeedHook
 from .hook import HOOKS, Hook
 from .lr_updater import LrUpdaterHook
