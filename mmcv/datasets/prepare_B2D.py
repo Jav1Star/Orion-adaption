@@ -19,7 +19,7 @@ OUT_DIR = '../../data/infos'
 
 MAX_DISTANCE = 75              # Filter bounding boxes that are too far from the vehicle
 FILTER_Z_SHRESHOLD = 10        # Filter bounding boxes that are too high/low from the vehicle
-FILTER_INVISINLE = True        # Filter bounding boxes based on visibility
+FILTER_INVISINLE = False       # 切 full 数据起训练时优先快速生成 infos，不做额外可见性过滤
 NUM_VISIBLE_SHRESHOLD = 1      # Filter bounding boxes with fewer visible vertices than this value
 NUM_OUTPOINT_SHRESHOLD = 7     # Filter bounding boxes where the number of vertices outside the frame is greater than this value in all cameras
 CAMERAS = ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
@@ -201,6 +201,8 @@ def preprocess(folder_list,idx,tmp_dir,train_or_val):
 
     for folder_name in folders:
         folder_path = join(data_root, folder_name)
+        if not os.path.isdir(join(folder_path, 'anno')) or not os.path.isdir(join(folder_path, 'expert_assessment')):
+            continue
         last_position_dict = {}
         for ann_name in sorted(os.listdir(join(folder_path,'anno')),key= lambda x: int(x.split('.')[0])):
             position_dict = {}
@@ -246,7 +248,8 @@ def preprocess(folder_list,idx,tmp_dir,train_or_val):
                 sensor_infos[cam]['intrinsic'] = np.array(anno['sensors'][cam]['intrinsic'])
                 sensor_infos[cam]['world2cam'] = np.linalg.inv(stand_to_ue4_rotate) @ np.array(anno['sensors'][cam]['world2cam']) @left2right
                 sensor_infos[cam]['data_path'] = join(folder_name,'camera',CAMERA_TO_FOLDER_MAP[cam],ann_name.split('.')[0]+'.jpg')
-                cam_gray_depth[cam] = cv2.imread(join(data_root,sensor_infos[cam]['data_path']).replace('rgb_','depth_').replace('.jpg','.png'))[:,:,0]
+                if FILTER_INVISINLE:
+                    cam_gray_depth[cam] = cv2.imread(join(data_root,sensor_infos[cam]['data_path']).replace('rgb_','depth_').replace('.jpg','.png'))[:,:,0]
             sensor_infos['LIDAR_TOP'] = {}
             sensor_infos['LIDAR_TOP']['lidar2ego'] = left2right @ np.array(anno['sensors']['LIDAR_TOP']['lidar2ego']) @ left2right @ lidar_to_righthand_ego
             world2lidar = lefthand_ego_to_lidar @ np.array(anno['sensors']['LIDAR_TOP']['world2lidar']) @ left2right

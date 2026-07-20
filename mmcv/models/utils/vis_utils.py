@@ -108,7 +108,7 @@ def get_rotz_matrix_array(rz):
 def gen_dx_bx(xbound, ybound, zbound, **kwargs):
     dx = np.array([row[2] for row in [xbound, ybound, zbound]])
     bx = np.array([row[0] for row in [xbound, ybound, zbound]])
-    nx = np.array([(row[1] - row[0]) / row[2] for row in [xbound, ybound, zbound]], dtype=np.long)
+    nx = np.array([(row[1] - row[0]) / row[2] for row in [xbound, ybound, zbound]], dtype=np.int64)
 
     return dx, bx, nx
 
@@ -380,8 +380,8 @@ def draw_bev_bboxes(grid_config, corners_3d_lidar, tasks,
 
     # draw selfcar
     selfcar_position = np.array([[-0.75, 1.5], [0.75, -1.5]])
-    selfcar_bev_x = ((selfcar_position[:, 0] - bx[0]) / dx[0] * ratio).astype(np.int)
-    selfcar_bev_y = bev_painter_h - ((selfcar_position[:, 1] - bx[1]) / dx[1] * ratio).astype(np.int)
+    selfcar_bev_x = ((selfcar_position[:, 0] - bx[0]) / dx[0] * ratio).astype(np.int32)
+    selfcar_bev_y = bev_painter_h - ((selfcar_position[:, 1] - bx[1]) / dx[1] * ratio).astype(np.int32)
     cv2.rectangle(img_bev, (selfcar_bev_x[0], selfcar_bev_y[0]),
                   (selfcar_bev_x[1], selfcar_bev_y[1]), _GRAY, -1)
 
@@ -399,13 +399,13 @@ def draw_bev_bboxes(grid_config, corners_3d_lidar, tasks,
         velo = pred_dict['box'][bbox_i, 7:9]
         next_pts_center = pts_center + velo
 
-        pts_bev = (pts_bev * ratio).astype(np.int)
+        pts_bev = (pts_bev * ratio).astype(np.int32)
         pts_bev[:, 1] = bev_painter_h - pts_bev[:, 1]
 
-        pts_center = (pts_center * ratio).astype(np.int)
+        pts_center = (pts_center * ratio).astype(np.int32)
         pts_center[1] = bev_painter_h - pts_center[1]
 
-        next_pts_center = (next_pts_center * ratio).astype(np.int)
+        next_pts_center = (next_pts_center * ratio).astype(np.int32)
         next_pts_center[1] = bev_painter_h - next_pts_center[1]
 
         box_task_names = [k['task_name'] for k in tasks if k['level'] == 'box']
@@ -793,7 +793,7 @@ def draw_img_ld(imgs, calib_infos, cams, map_res, is_aug=False, draw_point=False
                     continue
 
                 pts_2d = pts_2d[mask, :2]
-                pts_2d = np.round(pts_2d).astype(np.int)
+                pts_2d = np.round(pts_2d).astype(np.int32)
 
                 if lane_grad_color[lane_i]:
                     colors = gradient_color(lane_colors[lane_i], _BLUE2, len(pts_2d))
@@ -824,7 +824,7 @@ def gen_dx_bx_array(xbound, ybound, zbound, **kwargs):
     dx = np.array([row[2] for row in [xbound, ybound, zbound]])
     bx = np.array([row[0] for row in [xbound, ybound, zbound]])
     nx = np.array(
-        [(row[1] - row[0]) / row[2] for row in [xbound, ybound, zbound]], dtype=np.long
+        [(row[1] - row[0]) / row[2] for row in [xbound, ybound, zbound]], dtype=np.int64
     )
 
     return dx, bx, nx
@@ -849,7 +849,7 @@ def draw_bev_ld(img_bev, map_res, draw_point=True):
     lane_pts[..., 0] = (lane_pts[..., 0] - bx[0]) / dx[0]
     lane_pts[..., 1] = (lane_pts[..., 1] - bx[1]) / dx[1]
 
-    lane_pts = (lane_pts * ratio).astype(np.int)
+    lane_pts = (lane_pts * ratio).astype(np.int32)
     lane_pts[..., 1] = bev_painter_h - lane_pts[..., 1]
 
     for lane_i in range(len(lane_pts)):

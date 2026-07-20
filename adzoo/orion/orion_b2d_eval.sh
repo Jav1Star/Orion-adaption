@@ -52,7 +52,7 @@ B2D_ROOT="$ORION_ROOT/Bench2Drive"
 LEADERBOARD_ROOT="$B2D_ROOT/leaderboard"
 SCENARIO_RUNNER_ROOT="$B2D_ROOT/scenario_runner"
 TEAM_AGENT="$ORION_ROOT/team_code/orion_b2d_agent.py"
-ORION_ASSET_ROOT=${ORION_ASSET_ROOT:-/raid/yyj/Orion-adaption/Orion}
+ORION_ASSET_ROOT=${ORION_ASSET_ROOT:-"$HOME/Orion-adaption/Orion"}
 B2D_CKPT_DIR="$B2D_ROOT/ckpts"
 OUTDIR_ROOT=${OUTDIR_ROOT:-$ORION_ROOT/bench2drive_eval}
 AGENT_CONFIG_PATH=${AGENT_CONFIG_PATH:-$ORION_ROOT/adzoo/orion/configs/orion_stage3_agent.py}
@@ -115,6 +115,6 @@ elif [ -d "$ORION_ROOT/ckpts/pretrain_qformer" ]; then
     ln -sfn "$ORION_ROOT/ckpts/pretrain_qformer" "$B2D_CKPT_DIR/pretrain_qformer"
 fi
 cd "$B2D_ROOT"
-PYTHON_BIN=${PYTHON_BIN:-/home/yyj/miniconda3/envs/orion/bin/python}
+PYTHON_BIN=${PYTHON_BIN:-$(command -v python)}
 export PYTHON_BIN
 "$PYTHON_BIN" "$ORION_ROOT/adzoo/orion/orion_b2d_eval_runner.py"

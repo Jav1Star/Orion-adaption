@@ -12,6 +12,7 @@
 # ------------------------------------------------------------------------
 
 from sqlite3 import Timestamp
+import math
 import torch
 import torch.nn.functional as F
 from mmcv.utils import auto_fp16
@@ -31,7 +32,7 @@ from ...datasets.data_utils.constants import IGNORE_INDEX, EGO_WAYPOINT_TOKEN
 from mmcv.models import builder
 
 from ...utils.llava_llama import LlavaLlamaForCausalLM, add_special_token
-from ...utils.adalava_assigner import OrionBudgetAssigner
+from ...utils.adalava_assigner import OrionBudgetAssigner, budget_quantizing
 from transformers import AutoTokenizer, GenerationConfig
 
 from mmcv.utils.misc import load_model
@@ -63,6 +64,7 @@ import matplotlib.pyplot as plt
 from mmcv.utils.misc import memory_refresh
 from mmcv.models.utils import build_transformer
 from mmcv.models.builder import HEADS, build_loss 
+from mmcv.models.losses.orion_stage1_aux_loss import OrionStage1AuxLossComputer
 from mmcv.models.utils.vis_utils import format_bbox, show_multicam_bboxes, draw_ld_vis
 @DETECTORS.register_module()
 class Orion(MVXTwoStageDetector):
@@ -161,6 +163,7 @@ class Orion(MVXTwoStageDetector):
             self.map_head.ego_pose_pe = self.ego_pose_pe
 
         if tokenizer is not None:
+            tokenizer = os.path.expanduser(tokenizer)
             self.tokenizer =  AutoTokenizer.from_pretrained(tokenizer,
                                         model_max_length=2048,
                                         padding_side="right",
@@ -201,22 +204,34 @@ class Orion(MVXTwoStageDetector):
         self.adaption_assigner = None
         self.adaption_enabled = bool(self.adaption_cfg.get('enabled', False))
         self.adaption_num_prefix_layers = self.adaption_cfg.get('num_prefix_layers', None)
-        self.adaption_budget_candidates = self.adaption_cfg.get('budget_candidates', None)
         self.adaption_sceneaware_enabled = bool(self.adaption_cfg.get('sceneaware_enabled', False))
-        self.adaption_sceneaware_num_tokens = int(self.adaption_cfg.get('sceneaware_num_tokens', 0))
-        self.adaption_stage1_enable_prev_frame = bool(self.adaption_cfg.get('stage1_enable_prev_frame', False))
-        self.adaption_stage1_use_sceneaware = bool(self.adaption_cfg.get('stage1_use_sceneaware', False))
-        self.adaption_stage1_loss_mode = self.adaption_cfg.get('stage1_loss_mode', None)
-        self.adaption_stage1_driving_language_only = (
-            self.adaption_stage1_loss_mode == 'driving_language_only'
-        )
+        self.adaption_train_stage = self.adaption_cfg.get('train_stage', None)
+        self.adaption_budget_curriculum_start_min = self.adaption_cfg.get('budget_curriculum_start_min', 1.0)
+        self.adaption_budget_curriculum_warmup_steps = self.adaption_cfg.get('budget_curriculum_warmup_steps', 0)
+        self.adaption_sample_interval = int(self.adaption_cfg.get('sample_interval', 5))
+        self.adaption_stage1_enabled = self.adaption_train_stage == 'stage1'
+        self.adaption_stage1_aux_enabled = bool(self.adaption_cfg.get('stage1_aux_enabled', False))
+        self.adaption_stage1_aux_div_margin = float(self.adaption_cfg.get('stage1_aux_div_margin', 0.05))
+        self.adaption_stage1_aux_bal_epsilon = float(self.adaption_cfg.get('stage1_aux_bal_epsilon', 0.05))
+        self.adaption_stage1_aux_div_ratio_start = float(self.adaption_cfg.get('stage1_aux_div_ratio_start', 0.01))
+        self.adaption_stage1_aux_div_ratio_end = float(self.adaption_cfg.get('stage1_aux_div_ratio_end', 0.05))
+        self.adaption_stage1_aux_div_warmup_steps = int(self.adaption_cfg.get('stage1_aux_div_warmup_steps', 1000))
+        self.adaption_stage1_aux_bal_ratio = float(self.adaption_cfg.get('stage1_aux_bal_ratio', 0.01))
+        self.adaption_stage1_aux_loss_computer = None
         if self.adaption_enabled:
             if lm_head is None:
                 raise ValueError("lm_head must be set when adaption is enabled")
             if self.adaption_num_prefix_layers is None:
                 raise ValueError("adaption_cfg.num_prefix_layers must be set when adaption is enabled")
-            if not self.adaption_budget_candidates:
-                raise ValueError("adaption_cfg.budget_candidates must not be empty when adaption is enabled")
+            if not self.adaption_sceneaware_enabled:
+                raise ValueError("adaption requires sceneaware_enabled=True")
+            if self.adaption_stage1_aux_div_ratio_start > self.adaption_stage1_aux_div_ratio_end:
+                raise ValueError(
+                    "stage1_aux_div_ratio_start must be <= stage1_aux_div_ratio_end, got "
+                    f"{self.adaption_stage1_aux_div_ratio_start} > {self.adaption_stage1_aux_div_ratio_end}"
+                )
+            if self.adaption_stage1_aux_div_warmup_steps < 0:
+                raise ValueError(f"stage1_aux_div_warmup_steps must be >= 0, got {self.adaption_stage1_aux_div_warmup_steps}")
         if lm_head is not None:
             lm_kwargs = dict(
                 use_gen_token=use_gen_token,
@@ -231,17 +246,29 @@ class Orion(MVXTwoStageDetector):
                     hidden_size=self.lm_head.config.hidden_size,
                     num_hidden_layers=self.lm_head.config.num_hidden_layers,
                     num_prefix_layers=self.adaption_num_prefix_layers,
-                    budget_candidates=self.adaption_budget_candidates,
+                    train_stage=self.adaption_train_stage,
+                    budget_curriculum_start_min=self.adaption_budget_curriculum_start_min,
+                    budget_curriculum_warmup_steps=self.adaption_budget_curriculum_warmup_steps,
+                    sample_interval=self.adaption_sample_interval,
+                    path_gumbel_tau=float(self.adaption_cfg.get('path_gumbel_tau', 1.0)),
+                    path_gumbel_hard=bool(self.adaption_cfg.get('path_gumbel_hard', True)),
                 )
-                if self.adaption_sceneaware_enabled:
-                    if not self.with_map_head:
-                        raise ValueError("scene-aware requires map_head in Orion closed-loop inference")
-                    # 关键调用点：scene-aware 的历史状态与编码网络都归 assigner 统一管理。
-                    self.adaption_assigner.init_sceneaware_modules(
-                        sceneaware_cfg=self.adaption_cfg,
-                        det_num_classes=self.pts_bbox_head.num_classes,
-                        map_num_classes=self.map_head.num_classes,
-                    )
+                if not self.with_pts_bbox:
+                    raise ValueError("scene-aware requires pts_bbox_head in Orion closed-loop inference")
+                if not self.with_map_head:
+                    raise ValueError("scene-aware requires map_head in Orion closed-loop inference")
+                # 关键调用点：scene-aware 的历史状态与编码网络都归 assigner 统一管理。
+                self.adaption_assigner.init_sceneaware_modules(
+                    sceneaware_cfg=self.adaption_cfg,
+                    det_num_classes=self.pts_bbox_head.num_classes,
+                    map_num_classes=self.map_head.num_classes,
+                    visual_query_dim=self.pts_bbox_head.embed_dims,
+                    image_prefix_token_count=self.pts_bbox_head.num_extra + (
+                        self.pts_bbox_head.num_memory if self.pts_bbox_head.use_memory else 0
+                    ),
+                )
+                if self.adaption_stage1_enabled and self.adaption_stage1_aux_enabled:
+                    self.adaption_stage1_aux_loss_computer = OrionStage1AuxLossComputer()
         if use_gen_token:
             add_special_token([EGO_WAYPOINT_TOKEN], tokenizer = self.tokenizer, model = self.lm_head)
             self.lm_head.config.waypoint_token_idx = self.tokenizer(EGO_WAYPOINT_TOKEN, add_special_tokens=False).input_ids[0]
@@ -362,7 +389,7 @@ class Orion(MVXTwoStageDetector):
 
         self.freeze_backbone = freeze_backbone
         self.temporal_prompt_input = temporal_prompt_input
-        if self.adaption_stage1_driving_language_only:
+        if self.adaption_stage1_enabled:
             # 关键调用点：stage1 训练参数白名单由 Orion 统一收敛，避免分散到各 head / dataset。
             self._configure_adaption_stage1_trainable_parameters()
 
@@ -391,12 +418,12 @@ class Orion(MVXTwoStageDetector):
 
         if self.adaption_sceneaware_enabled:
             sceneaware_modules = [
-                self.adaption_assigner.visual_pair_mlp,
+                self.adaption_assigner.visual_encoder,
                 self.adaption_assigner.det_class_embed,
                 self.adaption_assigner.map_class_embed,
-                self.adaption_assigner.det_item_mlp,
-                self.adaption_assigner.map_item_mlp,
-                self.adaption_assigner.traj_mlp,
+                self.adaption_assigner.det_encoder,
+                self.adaption_assigner.map_encoder,
+                self.adaption_assigner.traj_encoder,
             ]
             for module in sceneaware_modules:
                 for param in module.parameters():
@@ -412,10 +439,13 @@ class Orion(MVXTwoStageDetector):
             if layer_idx < int(self.adaption_num_prefix_layers):
                 param.requires_grad = True
 
-    def _unwrap_batched_img_metas(self, img_metas):
-        return [img_meta[0] if isinstance(img_meta, (list, tuple)) else img_meta for img_meta in img_metas]
-
-    def _stack_meta_tensor(self, img_metas, key, device, dtype=torch.float32):
+    def _stack_meta_tensor(self, img_metas, key, device, dtype=torch.float32, fallback=None):
+        if len(img_metas) > 0 and key not in img_metas[0]:
+            if fallback is None:
+                raise KeyError(key)
+            if isinstance(fallback, torch.Tensor):
+                return fallback.detach().to(device=device, dtype=dtype)
+            return torch.as_tensor(np.asarray(fallback), device=device, dtype=dtype)
         meta_tensors = []
         for meta in img_metas:
             value = meta[key]
@@ -426,165 +456,135 @@ class Orion(MVXTwoStageDetector):
             meta_tensors.append(tensor)
         return torch.stack(meta_tensors, dim=0)
 
-    def _build_prev_forward_data(self, prev_img_metas, prev_img_feats, device):
-        return dict(
-            img_feats=prev_img_feats,
-            lidar2img=self._stack_meta_tensor(prev_img_metas, 'lidar2img', device=device),
-            cam_intrinsic=self._stack_meta_tensor(prev_img_metas, 'cam_intrinsic', device=device),
-            timestamp=self._stack_meta_tensor(prev_img_metas, 'timestamp', device=device),
-            ego_pose=self._stack_meta_tensor(prev_img_metas, 'ego_pose', device=device),
-            ego_pose_inv=self._stack_meta_tensor(prev_img_metas, 'ego_pose_inv', device=device),
-            can_bus=self._stack_meta_tensor(prev_img_metas, 'can_bus', device=device),
-            command=self._stack_meta_tensor(prev_img_metas, 'command', device=device),
-        )
+    def _extract_route_keys(self, img_metas):
+        return [img_meta.get('scene_token', img_meta.get('folder')) for img_meta in img_metas]
 
-    def _snapshot_head_memory(self, module):
-        snapshot = {}
-        for attr_name in [
-            'memory_embedding',
-            'memory_reference_point',
-            'memory_timestamp',
-            'memory_egopose',
-            'memory_velo',
-            'memory_canbus',
-            'memory_mask',
-            'memory_scene_tokens',
-            'memory_scene_query',
-            'scene_memory_timestamp',
-            'his_memory_canbus_len',
-        ]:
-            if not hasattr(module, attr_name):
-                continue
-            value = getattr(module, attr_name)
-            if torch.is_tensor(value):
-                snapshot[attr_name] = value.clone()
-            elif isinstance(value, list):
-                snapshot[attr_name] = list(value)
-            else:
-                snapshot[attr_name] = value
-        return snapshot
+    def _extract_frame_indices(self, img_metas):
+        return [int(img_meta['frame_idx']) for img_meta in img_metas]
 
-    def _restore_head_memory(self, module, snapshot):
-        for attr_name, value in snapshot.items():
-            setattr(module, attr_name, value)
+    def _select_current_frame_img_metas(self, img_metas):
+        # 关键调用点：训练态 scene-aware 历史必须绑定当前帧，不能误用 queue 的第 0 帧。
+        current_img_metas = []
+        for sample_img_metas in img_metas:
+            if not isinstance(sample_img_metas, dict) or len(sample_img_metas) == 0:
+                raise ValueError("img_metas must be a non-empty dict of queued frame metas in training")
+            current_key = max(sample_img_metas.keys())
+            current_img_metas.append(sample_img_metas[current_key])
+        return current_img_metas
 
-    def _build_sceneaware_state_from_prev_sample(
-        self,
-        prev_visual_summary,
-        prev_gt_bboxes_3d,
-        prev_gt_labels_3d,
-        prev_map_gt_bboxes_3d,
-        prev_map_gt_labels_3d,
-        prev_ego_fut_trajs,
-        has_prev_frame,
-    ):
-        if not has_prev_frame:
-            return dict(
-                prev_visual_summary=None,
-                prev_det_boxes=None,
-                prev_det_scores=None,
-                prev_det_labels=None,
-                prev_map_pts=None,
-                prev_map_scores=None,
-                prev_map_labels=None,
-                prev_ego_fut_preds=None,
-            )
-
-        det_labels = prev_gt_labels_3d.detach().to(dtype=torch.long).cpu()
-        map_labels = prev_map_gt_labels_3d.detach().to(dtype=torch.long).cpu()
-        map_points = prev_map_gt_bboxes_3d.fixed_num_sampled_points.detach().to(dtype=torch.float32).cpu()
-        if map_points.shape[-1] == 2:
-            map_points = F.pad(map_points, (0, 1))
-        ego_fut_preds = prev_ego_fut_trajs.detach().to(dtype=torch.float32).cpu()
-        if ego_fut_preds.ndim == 3:
-            ego_fut_preds = ego_fut_preds[0]
-        return dict(
-            prev_visual_summary=prev_visual_summary,
-            prev_det_boxes=prev_gt_bboxes_3d.tensor.detach().to(dtype=torch.float32).cpu(),
-            prev_det_scores=torch.ones(det_labels.shape[0], dtype=torch.float32),
-            prev_det_labels=det_labels,
-            prev_map_pts=map_points,
-            prev_map_scores=torch.ones(map_labels.shape[0], dtype=torch.float32),
-            prev_map_labels=map_labels,
-            prev_ego_fut_preds=ego_fut_preds,
-        )
-
-    def _prepare_stage1_sceneaware_batch(
-        self,
-        prev_img,
-        prev_img_metas,
-        prev_gt_bboxes_3d,
-        prev_gt_labels_3d,
-        prev_map_gt_bboxes_3d,
-        prev_map_gt_labels_3d,
-        prev_ego_fut_trajs,
-        has_prev_frame,
-    ):
-        if not self.adaption_sceneaware_enabled:
+    def set_adaption_total_iters(self, total_iters):
+        if self.adaption_assigner is None:
             return
-        has_prev_frame = has_prev_frame.reshape(-1).to(dtype=torch.bool)
-        if not has_prev_frame.any():
-            empty_states = [
-                self._build_sceneaware_state_from_prev_sample(
-                    prev_visual_summary=None,
-                    prev_gt_bboxes_3d=prev_gt_bboxes_3d[idx],
-                    prev_gt_labels_3d=prev_gt_labels_3d[idx],
-                    prev_map_gt_bboxes_3d=prev_map_gt_bboxes_3d[idx],
-                    prev_map_gt_labels_3d=prev_map_gt_labels_3d[idx],
-                    prev_ego_fut_trajs=prev_ego_fut_trajs[idx],
-                    has_prev_frame=False,
-                )
-                for idx in range(len(prev_gt_bboxes_3d))
-            ]
-            self.adaption_assigner.prepare_sceneaware_batch(empty_states)
-            return
+        self.adaption_assigner.set_stage1_budget_total_iters(total_iters)
 
-        prev_img_metas = self._unwrap_batched_img_metas(prev_img_metas)
-        pts_snapshot = self._snapshot_head_memory(self.pts_bbox_head) if self.with_pts_bbox else None
-        map_snapshot = self._snapshot_head_memory(self.map_head) if self.with_map_head else None
-        try:
-            with torch.no_grad():
-                prev_img_feats = self.extract_feat(prev_img)
-                prev_forward_data = self._build_prev_forward_data(
-                    prev_img_metas=prev_img_metas,
-                    prev_img_feats=prev_img_feats,
-                    device=prev_img.device,
-                )
-                prev_location = self.prepare_location(prev_img_metas, **prev_forward_data)
-                prev_pos_embed = self.position_embeding(prev_forward_data, prev_location, prev_img_metas)
-                prev_visual_tokens = []
-                if self.with_pts_bbox:
-                    _, prev_det_query = self.pts_bbox_head(prev_img_metas, prev_pos_embed, **prev_forward_data)
-                    prev_visual_tokens.append(prev_det_query)
-                if self.with_map_head:
-                    _, prev_map_query = self.map_head(prev_img_metas, prev_pos_embed, **prev_forward_data)
-                    prev_visual_tokens.append(prev_map_query)
-                prev_visual_tokens = torch.cat(prev_visual_tokens, dim=1)
-                prev_visual_summaries = prev_visual_tokens.mean(dim=1, keepdim=True).detach().to(
-                    dtype=torch.float32
-                ).cpu()
-        finally:
-            if self.with_pts_bbox:
-                self._restore_head_memory(self.pts_bbox_head, pts_snapshot)
-            if self.with_map_head:
-                self._restore_head_memory(self.map_head, map_snapshot)
+    def _decode_sceneaware_bbox_results(self, outs_bbox, img_metas):
+        bbox_results = []
+        if self.use_col_loss:
+            bbox_list = self.pts_bbox_head.get_motion_bboxes(outs_bbox, img_metas)
+            for bboxes, scores, labels, trajs in bbox_list:
+                bbox_result = bbox3d2result(bboxes, scores, labels)
+                bbox_result['trajs_3d'] = trajs.cpu()
+                bbox_results.append(bbox_result)
+        else:
+            bbox_list = self.pts_bbox_head.get_bboxes(outs_bbox, img_metas)
+            for bboxes, scores, labels in bbox_list:
+                bbox_results.append(bbox3d2result(bboxes, scores, labels))
+        return bbox_results
 
-        sceneaware_batch_states = []
-        for batch_idx in range(len(prev_gt_bboxes_3d)):
-            sceneaware_batch_states.append(
-                self._build_sceneaware_state_from_prev_sample(
-                    prev_visual_summary=prev_visual_summaries[batch_idx:batch_idx + 1]
-                    if bool(has_prev_frame[batch_idx].item())
-                    else None,
-                    prev_gt_bboxes_3d=prev_gt_bboxes_3d[batch_idx],
-                    prev_gt_labels_3d=prev_gt_labels_3d[batch_idx],
-                    prev_map_gt_bboxes_3d=prev_map_gt_bboxes_3d[batch_idx],
-                    prev_map_gt_labels_3d=prev_map_gt_labels_3d[batch_idx],
-                    prev_ego_fut_trajs=prev_ego_fut_trajs[batch_idx],
-                    has_prev_frame=bool(has_prev_frame[batch_idx].item()),
-                )
+    def _decode_sceneaware_lane_results(self, outs_lane, img_metas):
+        return self.map_head.get_bboxes(outs_lane, img_metas)
+
+    def _build_current_sceneaware_inputs(self, current_scene_queries, current_bbox_results, current_lane_results):
+        # 关键调用点：visual deviation 直接对 SceneQueries 做差，不再走 mean-pooling。
+        current_visual_queries = current_scene_queries.detach()
+        return current_visual_queries, current_bbox_results, current_lane_results
+
+    def _select_train_sceneaware_future_trajs(self, data, ego_fut_preds=None, diff_pose_preds=None, waypoint=None):
+        """关键调用点：训练态只把当前样本真正用于驾驶决策的单条轨迹写入 scene-aware cache。"""
+        if diff_pose_preds is not None:
+            cmd_mask = data['ego_fut_cmd'][:, 0, 0] == 1
+            return [traj.detach().to(dtype=torch.float32) for traj in diff_pose_preds[cmd_mask]]
+        if waypoint is not None:
+            waypoint = waypoint.reshape(data['img'].shape[0], -1, 2)
+            waypoint = waypoint.cumsum(dim=-2)
+            return [traj.detach().to(dtype=torch.float32) for traj in waypoint]
+        if ego_fut_preds is not None:
+            cmd_mask = data['ego_fut_cmd'][:, 0, 0] == 1
+            chosen_trajs = ego_fut_preds[cmd_mask].cumsum(dim=-2)
+            return [traj.detach().to(dtype=torch.float32) for traj in chosen_trajs]
+        return None
+
+    def _compute_stage1_aux_lambda_div(self, global_step: int) -> float:
+        ratio_start = float(self.adaption_stage1_aux_div_ratio_start)
+        ratio_end = float(self.adaption_stage1_aux_div_ratio_end)
+        warmup_steps = int(self.adaption_stage1_aux_div_warmup_steps)
+        if warmup_steps <= 0:
+            return ratio_end
+        progress = float(max(min(global_step, warmup_steps), 0)) / float(warmup_steps)
+        return float(ratio_start + 0.5 * (1.0 - math.cos(math.pi * progress)) * (ratio_end - ratio_start))
+
+    def _build_stage1_aux_loss_dict(self) -> dict:
+        if self.adaption_assigner is None or self.adaption_stage1_aux_loss_computer is None:
+            return {}
+        runtime_signals = self.adaption_assigner.get_stage1_aux_training_signals()
+        aux_losses = self.adaption_stage1_aux_loss_computer.compute(
+            language_inputs=runtime_signals['language_inputs'],
+            language_ids=runtime_signals['language_ids'],
+            language_inputs_mask=runtime_signals['language_inputs_mask'],
+            budget_token_features=runtime_signals['budget_token_features'],
+            path_mask_st=runtime_signals['path_mask_st'],
+            path_mask_hard=runtime_signals['path_mask_hard'],
+            budget_values=runtime_signals['budget_values'],
+            num_prefix_layers=runtime_signals['num_prefix_layers'],
+            num_hidden_layers=runtime_signals['num_hidden_layers'],
+            div_margin=self.adaption_stage1_aux_div_margin,
+            bal_epsilon=self.adaption_stage1_aux_bal_epsilon,
+        )
+        lambda_div = self._compute_stage1_aux_lambda_div(self.adaption_assigner.stage1_budget_runtime_iter)
+        lambda_bal = float(self.adaption_stage1_aux_bal_ratio)
+        ref_tensor = aux_losses['div_loss']
+        return {
+            'loss_div': torch.nan_to_num(aux_losses['div_loss'] * lambda_div),
+            'loss_bal': torch.nan_to_num(aux_losses['bal_loss'] * lambda_bal),
+            'stage1_aux_div_raw': torch.nan_to_num(aux_losses['div_loss']),
+            'stage1_aux_bal_raw': torch.nan_to_num(aux_losses['bal_loss']),
+            'stage1_aux_lambda_div': ref_tensor.new_tensor(lambda_div),
+            'stage1_aux_lambda_bal': ref_tensor.new_tensor(lambda_bal),
+            'stage1_aux_scene_similarity_mean': torch.nan_to_num(aux_losses['scene_similarity_mean']),
+            'stage1_aux_path_similarity_mean': torch.nan_to_num(aux_losses['path_similarity_mean']),
+            'stage1_aux_target_sub_budget': torch.nan_to_num(aux_losses['target_sub_budget']),
+            'stage1_aux_path_mask_hard_mean': torch.nan_to_num(aux_losses['path_mask_hard_mean']),
+            'stage1_aux_budget_mean': torch.nan_to_num(aux_losses['budget_mean']),
+        }
+
+    def _build_stage1_runtime_log_dict(self) -> dict:
+        """记录 stage1 的 budget / path 运行态统计，便于直接看日志。"""
+        if self.adaption_assigner is None or self.adaption_assigner.selected_budget_values is None:
+            return {}
+        budget_values = self.adaption_assigner.selected_budget_values
+        log_tensor = budget_values.mean()
+        log_dict = {
+            'stage1_budget_mean': torch.nan_to_num(budget_values.mean()),
+            'stage1_budget_min_value': torch.nan_to_num(budget_values.min()),
+            'stage1_budget_max_value': torch.nan_to_num(budget_values.max()),
+            'stage1_budget_floor': log_tensor.new_tensor(float(self.adaption_assigner.budget_min)),
+            'stage1_budget_curriculum_min': log_tensor.new_tensor(float(self.adaption_assigner._compute_stage1_curriculum_min())),
+        }
+        if self.adaption_assigner.execution_plan_hard is not None:
+            budget_units, _ = budget_quantizing(
+                budget=budget_values,
+                num_prefix_layers=self.adaption_assigner.num_prefix_layers,
+                num_hidden_layers=self.adaption_assigner.num_hidden_layers,
             )
-        self.adaption_assigner.prepare_sceneaware_batch(sceneaware_batch_states)
+            num_suffix_layers = max(1, int(self.adaption_assigner.num_suffix_layers))
+            path_mask_hard = self.adaption_assigner.execution_plan_hard.float()
+            log_dict.update(
+                stage1_budget_units_mean=torch.nan_to_num(budget_units.mean()),
+                stage1_suffix_budget_ratio=torch.nan_to_num((budget_units / float(num_suffix_layers)).mean()),
+                stage1_path_mask_hard_mean=torch.nan_to_num(path_mask_hard.mean()),
+                stage1_active_suffix_layers_mean=torch.nan_to_num(path_mask_hard.sum(dim=-1).mean()),
+            )
+        return log_dict
         
     # @auto_fp16(apply_to=('img'), out_fp32=True)
     def extract_img_feat(self, img):
@@ -751,8 +751,7 @@ class Orion(MVXTwoStageDetector):
             input_ids = None
             vlm_labels = None
             vlm_attn_mask = None
-        # img_metas = [img_metas[0][0]] # BUG:这样不是seq
-        img_metas = [img_meta[0] for img_meta in img_metas]
+        img_metas = self._select_current_frame_img_metas(img_metas)
 
         data['img_feats'] = self.extract_feat(data['img'])
         losses = self.forward_pts_train(gt_bboxes_3d, gt_labels_3d, gt_attr_labels,map_gt_bboxes_3d, map_gt_labels_3d, img_metas,input_ids, vlm_labels, vlm_attn_mask, ego_fut_trajs,**data)
@@ -792,9 +791,9 @@ class Orion(MVXTwoStageDetector):
         agent_outs = None
 
         if self.with_pts_bbox:
-            outs_bbox, det_query = self.pts_bbox_head(img_metas, pos_embed, **data) # (1, 257, 4096)
+            outs_bbox, det_query, current_scene_queries = self.pts_bbox_head(img_metas, pos_embed, **data) # (1, 257, 4096)
             vision_embeded_obj = det_query.clone()
-            if self.use_col_loss or not self.adaption_stage1_driving_language_only:
+            if self.use_col_loss or not self.adaption_stage1_enabled:
                 loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs_bbox, gt_attr_labels]
                 if self.pts_bbox_head.pred_traffic_light_state:
                     loss_inputs.append(data['traffic_state'])
@@ -803,13 +802,13 @@ class Orion(MVXTwoStageDetector):
                     loss, agent_outs = self.pts_bbox_head.loss(*loss_inputs)
                 else:
                     loss = self.pts_bbox_head.loss(*loss_inputs)
-                if not self.adaption_stage1_driving_language_only:
+                if not self.adaption_stage1_enabled:
                     losses.update(loss)
             
         if self.with_map_head:
             outs_lane, map_query = self.map_head(img_metas, pos_embed, **data)
             vision_embeded_map = map_query.clone()
-            if not self.adaption_stage1_driving_language_only:
+            if not self.adaption_stage1_enabled:
                 # reference vad trans
                 device = gt_labels_3d[0].device
                 map_gt_vecs_list = copy.deepcopy(map_gt_bboxes_3d)
@@ -824,19 +823,29 @@ class Orion(MVXTwoStageDetector):
                 losses.update(self.map_head.loss(*loss_inputs))
 
         if self.with_lm_head:
-            if self.adaption_stage1_enable_prev_frame and self.adaption_stage1_use_sceneaware:
-                self._prepare_stage1_sceneaware_batch(
-                    prev_img=data['prev_img'],
-                    prev_img_metas=data['prev_img_metas'],
-                    prev_gt_bboxes_3d=data['prev_gt_bboxes_3d'],
-                    prev_gt_labels_3d=data['prev_gt_labels_3d'],
-                    prev_map_gt_bboxes_3d=data['prev_map_gt_bboxes_3d'],
-                    prev_map_gt_labels_3d=data['prev_map_gt_labels_3d'],
-                    prev_ego_fut_trajs=data['prev_ego_fut_trajs'],
-                    has_prev_frame=data['has_prev_frame'],
+            vision_embeded = torch.cat([vision_embeded_obj, vision_embeded_map], dim=1)
+            current_bbox_results = None
+            current_lane_results = None
+            current_visual_queries = None
+            sceneaware_future_trajs = None
+            if self.adaption_sceneaware_enabled:
+                current_bbox_results = self._decode_sceneaware_bbox_results(outs_bbox, img_metas)
+                current_lane_results = self._decode_sceneaware_lane_results(outs_lane, img_metas)
+                current_visual_queries, current_bbox_results, current_lane_results = self._build_current_sceneaware_inputs(
+                    current_scene_queries=current_scene_queries,
+                    current_bbox_results=current_bbox_results,
+                    current_lane_results=current_lane_results,
+                )
+                # 关键调用点：训练态不再辅助重跑上一帧，scene-aware 只读 assigner 的 slot memory。
+                self.adaption_assigner.build_sceneaware_inputs_before_llm(
+                    current_visual_queries=current_visual_queries,
+                    current_det_results=current_bbox_results,
+                    current_map_results=current_lane_results,
+                    route_keys=self._extract_route_keys(img_metas),
+                    frame_idxs=self._extract_frame_indices(img_metas),
+                    sample_idxs=list(range(B)),
                 )
             if self.use_gen_token:
-                vision_embeded = torch.cat([vision_embeded_obj, vision_embeded_map], dim=1) # (1, 513, 4096)
                 vlm_loss, ego_feature = self.lm_head(
                     input_ids=input_ids,
                     attention_mask=vlm_attn_mask,
@@ -896,6 +905,10 @@ class Orion(MVXTwoStageDetector):
                     else:
                         loss_planning_dict = self.loss_planning(*loss_plan_input)
                     losses.update(loss_planning_dict)
+                    sceneaware_future_trajs = self._select_train_sceneaware_future_trajs(
+                        data=data,
+                        ego_fut_preds=ego_fut_preds,
+                    )
                     loss_vae_gen = self.loss_vae_gen(distribution_comp, data['ego_fut_masks'][:,0,0])
                     loss_vae_gen = torch.nan_to_num(loss_vae_gen)
                     losses.update(loss_vae_gen=loss_vae_gen)
@@ -951,6 +964,10 @@ class Orion(MVXTwoStageDetector):
                         trajectory_loss_dict[f"traj_diff_loss_bound_{idx}"] = trajectory_bound_loss
                         
                     losses.update(trajectory_loss_dict)
+                    sceneaware_future_trajs = self._select_train_sceneaware_future_trajs(
+                        data=data,
+                        diff_pose_preds=poses_reg_list[-1],
+                    )
                 elif self.use_mlp_decoder:
                     waypoint = self.waypoint_decoder(current_states)
                     waypoint = waypoint.reshape(-1,2)
@@ -961,9 +978,12 @@ class Orion(MVXTwoStageDetector):
                         wp_loss = wp_loss.mean()
                     wp_loss = torch.nan_to_num(wp_loss)
                     losses.update(wp_loss=wp_loss)
+                    sceneaware_future_trajs = self._select_train_sceneaware_future_trajs(
+                        data=data,
+                        waypoint=waypoint,
+                    )
             else:
                 waypoint = None
-                vision_embeded = torch.cat([vision_embeded_obj, vision_embeded_map], dim=1) # (1, 513, 4096)
                 vlm_loss = self.lm_head(
                     input_ids=input_ids,
                     attention_mask=vlm_attn_mask,
@@ -973,6 +993,28 @@ class Orion(MVXTwoStageDetector):
                     adalava_controller=self.adaption_assigner,
                 )
                 losses.update(vlm_loss=vlm_loss[0])
+            if self.adaption_stage1_enabled:
+                losses.update(self._build_stage1_runtime_log_dict())
+            if self.adaption_stage1_enabled and self.adaption_stage1_aux_enabled:
+                losses.update(self._build_stage1_aux_loss_dict())
+            if (
+                self.adaption_sceneaware_enabled
+                and current_visual_queries is not None
+                and sceneaware_future_trajs is not None
+            ):
+                self.adaption_assigner.update_sceneaware_history_after_llm(
+                    route_keys=self._extract_route_keys(img_metas),
+                    frame_idxs=self._extract_frame_indices(img_metas),
+                    current_visual_queries=current_visual_queries,
+                    current_det_results=current_bbox_results,
+                    current_map_results=current_lane_results,
+                    current_future_trajs=sceneaware_future_trajs,
+                    current_ego_poses=self._stack_meta_tensor(img_metas, 'ego_pose', device=vision_embeded.device, fallback=data.get('ego_pose')),
+                    current_timestamps=self._stack_meta_tensor(img_metas, 'timestamp', device=vision_embeded.device, fallback=data.get('timestamp')),
+                    sample_idxs=list(range(B)),
+                )
+            if self.adaption_stage1_enabled and self.adaption_assigner is not None:
+                self.adaption_assigner.advance_stage1_budget_runtime_iter()
         return losses
     
     def forward_test(self, img_metas, **data):
@@ -1008,7 +1050,7 @@ class Orion(MVXTwoStageDetector):
         pos_embed = self.position_embeding(data, location, img_metas)
         bbox_results = []
         if self.with_pts_bbox:
-            outs, det_query = self.pts_bbox_head(img_metas, pos_embed, **data)
+            outs, det_query, current_scene_queries = self.pts_bbox_head(img_metas, pos_embed, **data)
             vision_embeded_obj = det_query.clone()
             if self.use_col_loss:
                 bbox_list = self.pts_bbox_head.get_motion_bboxes(
@@ -1063,6 +1105,19 @@ class Orion(MVXTwoStageDetector):
         if self.with_lm_head:
             history_input_output_id = []
             vision_embeded = torch.cat([vision_embeded_obj, vision_embeded_map], dim=1) # (1, 513, 4096)
+            if self.adaption_sceneaware_enabled:
+                current_visual_queries, current_bbox_results, current_lane_results = self._build_current_sceneaware_inputs(
+                    current_scene_queries=current_scene_queries,
+                    current_bbox_results=bbox_results,
+                    current_lane_results=lane_results,
+                )
+                self.adaption_assigner.build_sceneaware_inputs_before_llm(
+                    current_visual_queries=current_visual_queries,
+                    current_det_results=current_bbox_results,
+                    current_map_results=current_lane_results,
+                    route_keys=self._extract_route_keys(img_metas),
+                    frame_idxs=self._extract_frame_indices(img_metas),
+                )
             for i, input_ids in enumerate(data['input_ids'][0]):
                 input_ids = input_ids.unsqueeze(0)
                 special_token_inputs = False
@@ -1272,12 +1327,16 @@ class Orion(MVXTwoStageDetector):
             and lane_results is not None
             and 'ego_fut_preds' in lane_results[0]
         ):
-            # 关键调用点：在本帧最终解码后写入历史，供下一帧 scene-aware 直接取用。
-            self.adaption_assigner.update_sceneaware_history(
-                bbox_result=bbox_results[0],
-                lane_result=lane_results[0],
-                ego_fut_pred=lane_results[0]['ego_fut_preds'],
-                current_vision_tokens=vision_embeded.detach(),
+            # 关键调用点：本帧只在 LLM 后更新 cache，下一帧 prefix 决策只读取已缓存偏差。
+            self.adaption_assigner.update_sceneaware_history_after_llm(
+                route_keys=self._extract_route_keys(img_metas),
+                frame_idxs=self._extract_frame_indices(img_metas),
+                current_visual_queries=current_visual_queries,
+                current_det_results=bbox_results,
+                current_map_results=lane_results,
+                current_future_trajs=[lane_result['ego_fut_preds'] for lane_result in lane_results],
+                current_ego_poses=self._stack_meta_tensor(img_metas, 'ego_pose', device=vision_embeded.device, fallback=data.get('ego_pose')),
+                current_timestamps=self._stack_meta_tensor(img_metas, 'timestamp', device=vision_embeded.device, fallback=data.get('timestamp')),
             )
 
         return bbox_results, generated_text, lane_results, metric_dict
@@ -1736,6 +1795,12 @@ class Orion(MVXTwoStageDetector):
 
         hidden_states = hidden_states.permute(1,0,2) # (4, 1, 4096) -> (1, 4, 4096)
         hidden_state = hidden_states.reshape(self.layer_dim, -1, int(4096/4)) # (4, 4, 1024)
+        predict_model_dtype = self.predict_model.gru.weight_ih_l0.dtype
+        if future_prediction_input.dtype != predict_model_dtype:
+            future_prediction_input = future_prediction_input.to(dtype=predict_model_dtype)
+        if hidden_state.dtype != predict_model_dtype:
+            # 关键调用点：stage1 的 fp16 LLM hidden states 进入 fp32 GRU 前，统一在这里做一次 dtype 对齐。
+            hidden_state = hidden_state.to(dtype=predict_model_dtype)
         future_states = self.predict_model(future_prediction_input, hidden_state)
 
         current_states_hs = current_states.unsqueeze(0).repeat(6, 1, 1, 1)

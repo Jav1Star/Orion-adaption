@@ -175,9 +175,9 @@ model = dict(
     use_grid_mask=True,
     frozen=False,
     use_lora=True,
-    tokenizer=llm_path,
-    lm_head=llm_path, # set to None if don't use llm head
-    adaption_cfg=orion_adaption_cfg,
+    tokenizer={{_base_.llm_path}},
+    lm_head={{_base_.llm_path}}, # set to None if don't use llm head
+    adaption_cfg={{_base_.orion_adaption_cfg}},
     use_gen_token = use_gen_token,
     use_diff_decoder = False, 
     use_col_loss = use_col_loss,
@@ -199,7 +199,7 @@ model = dict(
         ),
         qkv_bias=True,
         drop_path_rate=0.3,
-        flash_attn=True,
+        flash_attn={{_base_.use_flash_attn}},
         with_cp=True, 
         frozen=False,), 
     map_head=dict(
@@ -229,7 +229,7 @@ model = dict(
                  feedforward_dims=2048,
                  dropout=0.1,
                  with_cp=True,
-                 flash_attn=True,),
+                 flash_attn={{_base_.use_flash_attn}},),
         train_cfg=dict(
                 assigner=dict(
                     type='LaneHungarianAssigner',
@@ -272,7 +272,7 @@ model = dict(
             dropout=0.0,
             feedforward_dims=_ffn_dim_,
             with_cp=True,
-            flash_attn=True,
+            flash_attn={{_base_.use_flash_attn}},
             return_intermediate=False),
         motion_transformer_decoder=dict(
             type='OrionTransformerDecoder',
@@ -282,7 +282,7 @@ model = dict(
             dropout=0.0,
             feedforward_dims=_ffn_dim_,
             with_cp=True,
-            flash_attn=True,
+            flash_attn={{_base_.use_flash_attn}},
             return_intermediate=False,
             ),
         code_weights = [2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
@@ -304,7 +304,7 @@ model = dict(
                  feedforward_dims=2048,
                  dropout=0.1,
                  with_cp=True,
-                 flash_attn=True,
+                 flash_attn={{_base_.use_flash_attn}},
             ),
         bbox_coder=dict(
             type='NMSFreeCoder',
@@ -364,7 +364,7 @@ train_pipeline = [
     
     dict(type='LoadAnnoatationVQA', 
         base_desc_path='./data/chat-B2D/train',
-        tokenizer=llm_path, 
+        tokenizer={{_base_.llm_path}}, 
         max_length=2048, 
         use_gen_token=use_gen_token,
         pretrain = pretrain,
@@ -392,7 +392,7 @@ test_pipeline = [
     dict(type="PadMultiViewImage", size_divisor=32),
     dict(type='LoadAnnoatationCriticalVQATest', 
          load_type=["critical_qa"],
-         tokenizer=llm_path, 
+         tokenizer={{_base_.llm_path}}, 
          use_gen_token=use_gen_token,
          max_length=2048,),
 
@@ -530,5 +530,5 @@ log_config = dict(
     interval=10, hooks=[dict(type="TextLoggerHook"), dict(type="TensorboardLoggerHook")]
 )
 
-load_from='/raid/yyj/Orion-adaption/Orion/eva02_petr_proj.pth'
+load_from={{_base_.eva02_petr_proj_path}}
 resume_from=None

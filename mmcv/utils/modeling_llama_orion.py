@@ -532,14 +532,22 @@ class LlamaModel(LlamaPreTrainedModel):
         past_key_value,
         output_attentions: bool,
         use_cache: bool,
-        batch_mask: Optional[torch.BoolTensor] = None,
+        batch_mask: Optional[torch.Tensor] = None,
     ):
+        gate_values = None
         if batch_mask is not None:
-            if batch_mask.dtype != torch.bool:
-                raise ValueError("batch_mask must be a bool tensor")
-            if not torch.any(batch_mask):
-                return hidden_states, None, None
-            if torch.all(batch_mask):
+            if batch_mask.dtype == torch.bool:
+                if not torch.any(batch_mask):
+                    return hidden_states, None, None
+                if torch.all(batch_mask):
+                    batch_mask = None
+            else:
+                if batch_mask.ndim != 1 or batch_mask.shape[0] != hidden_states.shape[0]:
+                    raise ValueError(
+                        "training execution gate must have shape [batch], "
+                        f"got {tuple(batch_mask.shape)} vs batch {hidden_states.shape[0]}"
+                    )
+                gate_values = batch_mask.to(device=hidden_states.device, dtype=hidden_states.dtype).clamp(0.0, 1.0)
                 batch_mask = None
 
         selected_hidden_states = hidden_states
@@ -581,7 +589,11 @@ class LlamaModel(LlamaPreTrainedModel):
             )
 
         updated_hidden_states = layer_outputs[0]
-        if batch_mask is not None:
+        if gate_values is not None:
+            # 关键调用点：训练态用 ST mask 软门控隐藏状态，推理态仍走硬跳过分支。
+            gate_values = gate_values.view(-1, 1, 1)
+            next_hidden_states = hidden_states + gate_values * (updated_hidden_states - hidden_states)
+        elif batch_mask is not None:
             next_hidden_states = hidden_states.clone()
             next_hidden_states[batch_mask] = updated_hidden_states
         else:

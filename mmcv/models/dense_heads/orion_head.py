@@ -777,6 +777,8 @@ class OrionHead(AnchorFreeHead):
         else:
             vlm_memory = outs_dec[-1, :, :self.num_extra, :]
             outs_dec = outs_dec[:, :, self.num_extra:, :]
+        # 关键调用点：scene-aware visual deviation 直接读取当前帧 SceneQueries。
+        scene_queries = vlm_memory.clone()
         if self.use_memory :
             # 提取当前query的信息
             # scene query <-> scene query
@@ -943,7 +945,7 @@ class OrionHead(AnchorFreeHead):
             if self.pred_traffic_light_state:
                 outs.update(dict(all_traffic_states = all_traffic_states))
 
-        return outs, vlm_memory
+        return outs, vlm_memory, scene_queries
     
     def prepare_for_loss(self, mask_dict):
         """

@@ -157,7 +157,7 @@ eval_cfg = {
             "class_range":{'car':(50,50),'van':(50,50),'truck':(50,50),'bicycle':(40,40),'traffic_sign':(30,30),'traffic_cone':(30,30),'traffic_light':(30,30),'pedestrian':(40,40)}
             }
 
-queue_length = 1  # each sequence contains `queue_length` frames.
+queue_length = 1  # 与原版 Orion seq_mode 对齐，视觉输入固定为当前帧。
 ### traj prediction args ###
 predict_steps = 12
 predict_modes = 6
@@ -165,9 +165,8 @@ fut_steps = 4
 past_steps = 4
 use_nonlinear_optimizer = True
 use_memory = True
-num_gpus = 1
-batch_size = 2
-num_iters_per_epoch = 2295 // (num_gpus * batch_size)
+batch_size = 4
+num_iters_per_epoch = 1  # 运行时会按真实 world size 与数据集大小回填
 num_epochs = 6
 use_gen_token = True
 use_col_loss = False
@@ -177,12 +176,22 @@ mix_qa_training =True
 chat_b2d_train_root = '/dataset/bench2drive/chat-B2D/train'
 chat_b2d_val_root = '/dataset/bench2drive/chat-B2D/train'
 orion_adaption_cfg = dict(
-    orion_adaption_cfg,
+    enabled={{_base_.orion_adaption_cfg.enabled}},
+    num_prefix_layers=16,
+    budget_curriculum_start_min={{_base_.orion_adaption_cfg.budget_curriculum_start_min}},
+    budget_curriculum_warmup_steps={{_base_.orion_adaption_cfg.budget_curriculum_warmup_steps}},
+    path_gumbel_tau={{_base_.orion_adaption_cfg.path_gumbel_tau}},
+    path_gumbel_hard={{_base_.orion_adaption_cfg.path_gumbel_hard}},
+    stage1_aux_enabled=True,
+    stage1_aux_div_margin={{_base_.orion_adaption_cfg.stage1_aux_div_margin}},
+    stage1_aux_bal_epsilon={{_base_.orion_adaption_cfg.stage1_aux_bal_epsilon}},
+    stage1_aux_div_ratio_start={{_base_.orion_adaption_cfg.stage1_aux_div_ratio_start}},
+    stage1_aux_div_ratio_end={{_base_.orion_adaption_cfg.stage1_aux_div_ratio_end}},
+    stage1_aux_div_warmup_steps={{_base_.orion_adaption_cfg.stage1_aux_div_warmup_steps}},
+    stage1_aux_bal_ratio={{_base_.orion_adaption_cfg.stage1_aux_bal_ratio}},
     sceneaware_enabled=True,
-    sceneaware_num_tokens=4,
-    stage1_enable_prev_frame=True,
-    stage1_use_sceneaware=True,
-    stage1_loss_mode='driving_language_only',
+    sample_interval={{_base_.sample_interval}},
+    train_stage='stage1',
 )
 input_modality = dict(
     use_lidar=False,
@@ -197,8 +206,8 @@ model = dict(
     use_grid_mask=True,
     frozen=False,
     use_lora=True,
-    tokenizer=llm_path,
-    lm_head=llm_path, # set to None if don't use llm head
+    tokenizer={{_base_.llm_path}},
+    lm_head={{_base_.llm_path}}, # set to None if don't use llm head
     adaption_cfg=orion_adaption_cfg,
     use_gen_token = use_gen_token,
     use_diff_decoder = False, 
@@ -223,7 +232,7 @@ model = dict(
         ),
         qkv_bias=True,
         drop_path_rate=0.3,
-        flash_attn=True,
+        flash_attn={{_base_.use_flash_attn}},
         with_cp=True, 
         frozen=False,), 
     map_head=dict(
@@ -253,7 +262,7 @@ model = dict(
                  feedforward_dims=2048,
                  dropout=0.1,
                  with_cp=True,
-                 flash_attn=True,),
+                 flash_attn={{_base_.use_flash_attn}},),
         train_cfg=dict(
                 assigner=dict(
                     type='LaneHungarianAssigner',
@@ -297,7 +306,7 @@ model = dict(
             dropout=0.0,
             feedforward_dims=_ffn_dim_,
             with_cp=True,
-            flash_attn=True,
+            flash_attn={{_base_.use_flash_attn}},
             return_intermediate=False,
             ),
         code_weights = [2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
@@ -317,7 +326,7 @@ model = dict(
             dropout=0.0,
             feedforward_dims=_ffn_dim_,
             with_cp=True,
-            flash_attn=True,
+            flash_attn={{_base_.use_flash_attn}},
             return_intermediate=False),
         transformer=dict(
             type='PETRTemporalTransformer',
@@ -329,7 +338,7 @@ model = dict(
                  feedforward_dims=2048,
                  dropout=0.1,
                  with_cp=True,
-                 flash_attn=True,
+                 flash_attn={{_base_.use_flash_attn}},
             ),
         bbox_coder=dict(
             type='CustomNMSFreeCoder',
@@ -386,7 +395,7 @@ train_pipeline = [
     
     dict(type='LoadAnnoatationVQA', 
         base_desc_path=chat_b2d_train_root,
-        tokenizer=llm_path, 
+        tokenizer={{_base_.llm_path}}, 
         max_length=2048, 
         use_gen_token=use_gen_token,
         planning_qa_ratio=0.8,
@@ -417,7 +426,7 @@ test_pipeline = [
     dict(type="PadMultiViewImage", size_divisor=32),
     dict(type='LoadAnnoatationCriticalVQATest', 
          load_type=["critical_qa"],
-         tokenizer=llm_path, 
+         tokenizer={{_base_.llm_path}}, 
          use_gen_token=use_gen_token,
          max_length=2048,),
 
@@ -471,7 +480,7 @@ train=dict(
         type=dataset_type,
         seq_mode=True,
         seq_split_num=1,
-        stage1_enable_prev_frame=True,
+        queue_length=queue_length,
         data_root=data_root,
         ann_file=ann_file_train,
         pipeline=train_pipeline,
@@ -480,7 +489,6 @@ train=dict(
         map_root=map_root,
         map_file=map_file,
         modality=input_modality,
-        queue_length=queue_length,
         past_frames=past_frames,
         future_frames=future_frames,
         point_cloud_range=point_cloud_range,
@@ -552,14 +560,19 @@ lr_config = dict(
     min_lr_ratio=1e-3,
     )
 
-evaluation = dict(interval=num_iters_per_epoch*(num_epochs+1), pipeline=test_pipeline) # no eval
-find_unused_parameters=False #### when use checkpoint, find_unused_parameters must be False
-checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=3)
+evaluation = dict(
+    interval=num_iters_per_epoch,
+    pipeline=test_pipeline,
+    save_best='bbox_NuScenes/NDS',
+    rule='greater',
+)
+find_unused_parameters=True
+checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=1)
 runner = dict(
     type='IterBasedRunner', max_iters=num_epochs * num_iters_per_epoch)
 log_config = dict(
     interval=10, hooks=[dict(type="TextLoggerHook"), dict(type="TensorboardLoggerHook")]
 )
 
-load_from=None
+load_from={{_base_.orion_checkpoint_path}}
 resume_from=None

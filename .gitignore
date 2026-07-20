@@ -15,3 +15,8 @@ __pycache__/
 *.npz
 *.tar.gz
 *.gz
+
+adzoo/orion/work_dirs
+adzoo/orion/test_script
+work_dirs
+test/

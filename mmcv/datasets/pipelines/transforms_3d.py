@@ -629,12 +629,12 @@ class VADObjectRangeFilter(object):
         # using mask to index gt_labels_3d will cause bug when
         # len(gt_labels_3d) == 1, where mask=1 will be interpreted
         # as gt_labels_3d[1] and cause out of index error
-        gt_labels_3d = gt_labels_3d[mask.numpy().astype(np.bool)]
+        gt_labels_3d = gt_labels_3d[mask.numpy().astype(bool)]
         if 'traffic_state_mask' in input_dict:
             gt_traffic_state = input_dict['traffic_state']
             gt_traffic_state_mask = input_dict['traffic_state_mask']
-            gt_traffic_state = gt_traffic_state[mask.numpy().astype(np.bool)]
-            gt_traffic_state_mask = gt_traffic_state_mask[mask.numpy().astype(np.bool)]
+            gt_traffic_state = gt_traffic_state[mask.numpy().astype(bool)]
+            gt_traffic_state_mask = gt_traffic_state_mask[mask.numpy().astype(bool)]
             input_dict['traffic_state'] = gt_traffic_state 
             input_dict['traffic_state_mask'] = gt_traffic_state_mask
 
@@ -647,7 +647,7 @@ class VADObjectRangeFilter(object):
 
         if 'attr_labels' in input_dict:
             gt_attr_labels = input_dict['attr_labels']
-            gt_attr_labels = gt_attr_labels[mask.numpy().astype(np.bool)]
+            gt_attr_labels = gt_attr_labels[mask.numpy().astype(bool)]
             input_dict['gt_attr_labels'] = gt_attr_labels
 
         return input_dict
@@ -883,6 +883,7 @@ class LoadAnnoatationVQA():
             mix_qa_training=False,
             ):
         
+        tokenizer = os.path.expanduser(tokenizer)
         self.tokenizer =  AutoTokenizer.from_pretrained(tokenizer,
                                             model_max_length=max_length,
                                             padding_side="right",
@@ -1084,6 +1085,7 @@ class LoadAnnoatationCriticalVQATest():
             use_gen_token=False,
             merge_multiround_qa_into_one=False,
             ):
+        tokenizer = os.path.expanduser(tokenizer)
         self.tokenizer =  AutoTokenizer.from_pretrained(tokenizer,
                                             model_max_length=max_length,
                                             padding_side="right",

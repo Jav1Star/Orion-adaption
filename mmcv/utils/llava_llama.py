@@ -130,8 +130,17 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             )
         else:
             new_input_ids = None
+        if inputs_embeds is not None:
+            llm_input_dtype = self.model.embed_tokens.weight.dtype
+            if inputs_embeds.dtype != llm_input_dtype:
+                # 关键调用点：stage1 复用 fp16 LLM 权重时，拼好的多模态 embeds 需要先对齐到 LLM dtype。
+                inputs_embeds = inputs_embeds.to(dtype=llm_input_dtype)
         if adalava_controller is not None and new_input_ids is not None:
-            adalava_controller.prepare_llm_runtime(new_input_ids)
+            adalava_controller.prepare_llm_runtime(
+                new_input_ids,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+            )
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

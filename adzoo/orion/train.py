@@ -33,6 +33,26 @@ import sys
 sys.path.append('')
 
 
+def _update_iter_based_runtime_schedule(cfg, train_dataset):
+    if cfg.get('runner', {}).get('type', None) != 'IterBasedRunner':
+        return
+
+    _, world_size = get_dist_info()
+    world_size = max(int(world_size), 1)
+    samples_per_gpu = int(cfg.data.samples_per_gpu)
+    num_epochs = int(cfg.get('num_epochs', 1))
+    num_iters_per_epoch = max(len(train_dataset) // max(world_size * samples_per_gpu, 1), 1)
+
+    cfg.num_iters_per_epoch = num_iters_per_epoch
+    cfg.runner.max_iters = num_epochs * num_iters_per_epoch
+    if cfg.get('checkpoint_config', None) is not None:
+        cfg.checkpoint_config.interval = num_iters_per_epoch
+    if cfg.get('evaluation', None) is not None:
+        cfg.evaluation.interval = num_iters_per_epoch * (num_epochs + 1)
+    if cfg.data.get('shuffler_sampler', None) is not None and 'num_iters_to_seq' in cfg.data.shuffler_sampler:
+        cfg.data.shuffler_sampler.num_iters_to_seq = num_iters_per_epoch
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
     parser.add_argument('config', help='train config file path')
@@ -201,6 +221,13 @@ def main():
 
     logger.info(f'Model:\n{model}')
     datasets = [build_dataset(cfg.data.train)]
+    _update_iter_based_runtime_schedule(cfg, datasets[0])
+    if hasattr(model, 'set_adaption_total_iters'):
+        model.set_adaption_total_iters(cfg.runner.max_iters)
+    logger.info(
+        f'IterBased runtime schedule: num_iters_per_epoch={cfg.get("num_iters_per_epoch", "n/a")}, '
+        f'max_iters={cfg.runner.max_iters}'
+    )
     if len(cfg.workflow) == 2:
         val_dataset = copy.deepcopy(cfg.data.val)
         # in case we use a dataset wrapper
