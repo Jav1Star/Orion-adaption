@@ -574,9 +574,10 @@ class OrionBudgetAssigner(nn.Module):
         if self.training:
             self._ensure_sample_batch_size(sample_idxs, batch_size)
 
-        self.to(device=current_visual_queries.device, dtype=current_visual_queries.dtype)
         device = current_visual_queries.device
-        dtype = current_visual_queries.dtype
+        # 关键调用点：scene-aware 编码器保持训练参数原始 dtype，
+        # 这里只对输入张量做对齐，避免前向中途原地改权重 dtype 影响反传。
+        dtype = self.visual_encoder.conv.weight.dtype
 
         sceneaware_tokens = []
         for batch_idx in range(batch_size):
@@ -798,7 +799,6 @@ class OrionBudgetAssigner(nn.Module):
             state["last_frame_idx"] = int(frame_idxs[batch_idx])
 
     def get_query_embeddings(self, device, dtype):
-        self.to(device=device, dtype=dtype)
         budget_query = self.budget_query_embed.to(device=device, dtype=dtype)
         path_query = self.path_query_embed.to(device=device, dtype=dtype)
         return budget_query, path_query
@@ -909,6 +909,9 @@ class OrionBudgetAssigner(nn.Module):
                 dtype=torch.float32,
             )
         else:
+            # 关键调用点：预算调度器保持训练参数原始 dtype，
+            # 前向时只把输入对齐到权重 dtype，避免 bf16 hidden 直接喂给 fp32 Linear。
+            budget_hidden = budget_hidden.to(dtype=self.budget_scheduler[0].weight.dtype)
             budget_logits = self.budget_scheduler(budget_hidden)
             budget_probs = F.softmax(budget_logits, dim=-1)
             selected_budget_indices = budget_logits.argmax(dim=-1)
@@ -956,6 +959,9 @@ class OrionBudgetAssigner(nn.Module):
         sceneaware_hidden = hidden_states[batch_indices[:, None], sceneaware_positions].reshape(hidden_states.shape[0], -1)
         path_hidden = self._gather_query_hidden(hidden_states, self.path_query_positions)
         scheduler_inputs = torch.cat([sceneaware_hidden, path_hidden, self.runtime_budget_features], dim=-1)
+        # 关键调用点：path scheduler 与 prefix LoRA 一样保留 fp32 训练，
+        # 这里只对输入做 dtype 对齐，让梯度继续回到 fp32 可训练参数。
+        scheduler_inputs = scheduler_inputs.to(dtype=self.path_scheduler[0].weight.dtype)
         path_logits = self.path_scheduler(scheduler_inputs)
         self.path_logits = path_logits
         execution_plan_hard = torch.zeros_like(path_logits, dtype=torch.bool)

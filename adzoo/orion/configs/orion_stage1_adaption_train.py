@@ -165,9 +165,11 @@ fut_steps = 4
 past_steps = 4
 use_nonlinear_optimizer = True
 use_memory = True
-batch_size = 4
+samples_per_gpu = 2
+grad_accum_iters = 2
+effective_batch_size = samples_per_gpu * grad_accum_iters
 num_iters_per_epoch = 1  # 运行时会按真实 world size 与数据集大小回填
-num_epochs = 6
+num_epochs = 2
 use_gen_token = True
 use_col_loss = False
 collect_keys = ['lidar2img', 'cam_intrinsic', 'timestamp', 'ego_pose', 'ego_pose_inv', 'command']
@@ -177,7 +179,7 @@ chat_b2d_train_root = '/dataset/bench2drive/chat-B2D/train'
 chat_b2d_val_root = '/dataset/bench2drive/chat-B2D/train'
 orion_adaption_cfg = dict(
     enabled={{_base_.orion_adaption_cfg.enabled}},
-    num_prefix_layers=16,
+    num_prefix_layers={{_base_.orion_adaption_cfg.num_prefix_layers}},
     budget_curriculum_start_min={{_base_.orion_adaption_cfg.budget_curriculum_start_min}},
     budget_curriculum_warmup_steps={{_base_.orion_adaption_cfg.budget_curriculum_warmup_steps}},
     path_gumbel_tau={{_base_.orion_adaption_cfg.path_gumbel_tau}},
@@ -206,6 +208,7 @@ model = dict(
     use_grid_mask=True,
     frozen=False,
     use_lora=True,
+    bf16_train=True,
     tokenizer={{_base_.llm_path}},
     lm_head={{_base_.llm_path}}, # set to None if don't use llm head
     adaption_cfg=orion_adaption_cfg,
@@ -474,7 +477,7 @@ inference_only_pipeline = [
     ),
 ]
 data = dict(
-    samples_per_gpu=batch_size,
+    samples_per_gpu=samples_per_gpu,
     workers_per_gpu=4,
 train=dict(
         type=dataset_type,
@@ -543,14 +546,18 @@ optimizer = dict(constructor='LearningRateDecayOptimizerConstructor', type='Adam
                  lr=8e-5, betas=(0.9, 0.999), weight_decay=1e-5,
                  paramwise_cfg={'decay_rate': 0.9,
                                 'head_decay_rate': 4.0,
-                                'lm_head_decay_rate': 0.1,
+                                'lm_head_decay_rate': 0.2,
                                 'decay_type': 'vit_wise',
                                 'num_layers': 24,
                                 })
 
-# optimizer_config = dict(loss_scale='dynamic', grad_clip=dict(max_norm=35, norm_type=2))
-# optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
-optimizer_config = dict(type='Fp16OptimizerHook', loss_scale='dynamic', grad_clip=dict(max_norm=35, norm_type=2))
+bf16 = dict(enabled=True)
+# 关键调用点：stage1 固定按单卡小 batch + 累积梯度运行，避免脚本默认覆盖后出现配置语义漂移。
+optimizer_config = dict(
+    type='GradientCumulativeOptimizerHook',
+    cumulative_iters=grad_accum_iters,
+    grad_clip=dict(max_norm=35, norm_type=2),
+)
 # learning policy
 lr_config = dict(
     policy='CosineAnnealing',

@@ -411,16 +411,24 @@ def locations(features, stride, pad_h, pad_w):
         
         return locations
     
-def load_model(base_model, use_lora, frozen, lm_kwargs=dict(), fp16_infer=False):
+def load_model(base_model, use_lora, frozen, lm_kwargs=dict(), fp16_infer=False, frozen_dtype=None):
     base_model = os.path.expanduser(base_model)
+    if fp16_infer and frozen_dtype is not None:
+        raise ValueError('frozen_dtype is not supported together with fp16_infer')
     if fp16_infer:
-        model = LlavaLlamaForCausalLM.from_pretrained(base_model, torch_dtype=torch.float16, device_map='cpu', **lm_kwargs)
+        model_dtype = torch.float16
         # use_lora = False
         frozen = True
     else:
-        model = LlavaLlamaForCausalLM.from_pretrained(base_model, torch_dtype=torch.float32, device_map='cpu', **lm_kwargs)
+        model_dtype = torch.float32 if frozen_dtype is None else frozen_dtype
+    model = LlavaLlamaForCausalLM.from_pretrained(
+        base_model,
+        torch_dtype=model_dtype,
+        device_map='cpu',
+        **lm_kwargs)
     
-    model.gradient_checkpointing_enable()
+    if frozen_dtype is None:
+        model.gradient_checkpointing_enable()
 
     if frozen:
         model.eval()
@@ -437,9 +445,12 @@ def load_model(base_model, use_lora, frozen, lm_kwargs=dict(), fp16_infer=False)
                 task_type="CAUSAL_LM")
         model = get_peft_model(model, peft_config)
 
+        # 关键调用点：stage1 训练固定让 LoRA 保持 fp32，只压缩冻结底座到 bf16，
+        # 让 PEFT 在线性层内部完成 dtype 对齐，同时保住可训练参数的数值稳定性。
+        trainable_dtype = torch.float32
         if not fp16_infer:
-            for param in filter(lambda p: p.requires_grad,model.parameters()):
-                param.data = param.data.to(torch.float32)  
+            for param in filter(lambda p: p.requires_grad, model.parameters()):
+                param.data = param.data.to(trainable_dtype)
     return model
 
 class MLN(nn.Module):

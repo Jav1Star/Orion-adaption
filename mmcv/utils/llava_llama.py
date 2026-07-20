@@ -91,6 +91,24 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     def get_model(self):
         return self.model
 
+    def _extract_ego_hidden_states(self, hidden_states, new_input_ids):
+        if not isinstance(self.config.waypoint_token_idx, list):
+            loc_positions = (new_input_ids == self.config.waypoint_token_idx)
+            selected_hidden_states = hidden_states[loc_positions.to(device=hidden_states.device)]
+        else:
+            loc_positions_list = []
+            for new_id in new_input_ids:
+                loc_positions = torch.zeros_like(new_id).to(torch.bool)
+                for token_id in self.config.waypoint_token_idx:
+                    if token_id in new_id:
+                        loc_positions = torch.logical_or(loc_positions, new_id == token_id)
+                loc_positions_list.append(loc_positions)
+            loc_positions = torch.stack(loc_positions_list, dim=0)
+            selected_hidden_states = hidden_states[loc_positions.to(device=hidden_states.device)]
+        # 关键调用点：stage1 规划头默认在 fp32 路径上继续反传，这里先显式升到 fp32，
+        # 让梯度在回到 LLM 前经过一次 dtype cast，避免直接把 float32 grad 打到 bf16 权重链路。
+        return selected_hidden_states.to(torch.float32)
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -164,19 +182,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         hidden_states = outputs[0]
 
         if return_ego_feature:
-            if not isinstance(self.config.waypoint_token_idx, list):
-                loc_positions = ( (new_input_ids == self.config.waypoint_token_idx))
-                selected_hidden_states = hidden_states[loc_positions.to(device = hidden_states.device)]
-            else:
-                loc_positions_list = []
-                for new_id in new_input_ids:
-                    loc_positions = torch.zeros_like(new_id).to(torch.bool)
-                    for token_id in self.config.waypoint_token_idx:
-                        if token_id in new_id:
-                            loc_positions = torch.logical_or(loc_positions, new_id == token_id)
-                    loc_positions_list.append(loc_positions)
-                loc_positions = torch.stack(loc_positions_list,dim=0)
-                selected_hidden_states = hidden_states[loc_positions.to(device = hidden_states.device)]
+            selected_hidden_states = self._extract_ego_hidden_states(hidden_states, new_input_ids)
         if self.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.pretraining_tp, dim=0)
             logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.pretraining_tp)]
@@ -326,20 +332,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         hidden_states = outputs[0]
 
         if return_ego_feature:
-            if not isinstance(self.config.waypoint_token_idx, list):
-                loc_positions = ( (new_input_ids == self.config.waypoint_token_idx))
-                selected_hidden_states = hidden_states[loc_positions.to(device = hidden_states.device)]
-            else:
-                loc_positions_list = []
-                for new_id in new_input_ids:
-                    loc_positions = torch.zeros_like(new_id).to(torch.bool)
-                    for token_id in self.config.waypoint_token_idx:
-                        if token_id in new_id:
-                            loc_positions = torch.logical_or(loc_positions, new_id == token_id)
-                    loc_positions_list.append(loc_positions)
-                loc_positions = torch.stack(loc_positions_list,dim=0)
-                selected_hidden_states = hidden_states[loc_positions.to(device = hidden_states.device)]
-            return selected_hidden_states
+            return self._extract_ego_hidden_states(hidden_states, new_input_ids)
         else:
             assert False
         
