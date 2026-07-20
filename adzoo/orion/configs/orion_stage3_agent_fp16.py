@@ -194,7 +194,24 @@ num_iters_per_epoch = 234769 // (num_gpus * batch_size)
 num_epochs = 6
 use_gen_token = True
 use_col_loss = True
-orion_adaption_cfg = dict(orion_adaption_cfg, sceneaware_enabled=True, sceneaware_num_tokens=4)
+orion_adaption_cfg = dict(
+    enabled={{_base_.orion_adaption_cfg.enabled}},
+    num_prefix_layers={{_base_.orion_adaption_cfg.num_prefix_layers}},
+    budget_curriculum_start_min={{_base_.orion_adaption_cfg.budget_curriculum_start_min}},
+    budget_curriculum_warmup_steps={{_base_.orion_adaption_cfg.budget_curriculum_warmup_steps}},
+    path_gumbel_tau={{_base_.orion_adaption_cfg.path_gumbel_tau}},
+    path_gumbel_hard={{_base_.orion_adaption_cfg.path_gumbel_hard}},
+    stage1_aux_enabled={{_base_.orion_adaption_cfg.stage1_aux_enabled}},
+    stage1_aux_div_margin={{_base_.orion_adaption_cfg.stage1_aux_div_margin}},
+    stage1_aux_bal_epsilon={{_base_.orion_adaption_cfg.stage1_aux_bal_epsilon}},
+    stage1_aux_div_ratio_start={{_base_.orion_adaption_cfg.stage1_aux_div_ratio_start}},
+    stage1_aux_div_ratio_end={{_base_.orion_adaption_cfg.stage1_aux_div_ratio_end}},
+    stage1_aux_div_warmup_steps={{_base_.orion_adaption_cfg.stage1_aux_div_warmup_steps}},
+    stage1_aux_bal_ratio={{_base_.orion_adaption_cfg.stage1_aux_bal_ratio}},
+    sceneaware_enabled=True,
+    sample_interval={{_base_.sample_interval}},
+    train_stage={{_base_.orion_adaption_cfg.train_stage}},
+)
 collect_keys = ['lidar2img', 'cam_intrinsic', 'timestamp', 'ego_pose', 'ego_pose_inv', 'command']
 # pretrain = True
 
@@ -213,8 +230,8 @@ model = dict(
     fp16_eval=fp16_infer,
     frozen=False,
     use_lora=True,
-    tokenizer=llm_path,
-    lm_head=llm_path, # set to None if don't use llm head
+    tokenizer={{_base_.llm_path}},
+    lm_head={{_base_.llm_path}}, # set to None if don't use llm head
     adaption_cfg=orion_adaption_cfg,
     use_gen_token = use_gen_token,
     use_diff_decoder = False, 
@@ -356,7 +373,7 @@ test_pipeline = [
     dict(type="PadMultiViewImage", size_divisor=32),
     dict(type='LoadAnnoatationCriticalVQATest', 
          load_type=["critical_qa"],
-         tokenizer=llm_path, 
+         tokenizer={{_base_.llm_path}}, 
          use_gen_token=use_gen_token,
          max_length=2048,
          desc_qa=False),
@@ -386,7 +403,7 @@ inference_only_pipeline = [
     dict(type="PadMultiViewImage", size_divisor=32),
     dict(type='LoadAnnoatationCriticalVQATest', 
          load_type=["critical_qa"],
-         tokenizer=llm_path, 
+         tokenizer={{_base_.llm_path}}, 
          use_gen_token=use_gen_token,
          max_length=2048,
          desc_qa=False),

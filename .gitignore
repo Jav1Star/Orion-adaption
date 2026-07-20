@@ -12,3 +12,6 @@ __pycache__/
 *.pth
 *.bin
 *.model
+adzoo/orion/work_dirs
+adzoo/orion/test_script
+work_dirs

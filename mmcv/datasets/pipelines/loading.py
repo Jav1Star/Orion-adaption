@@ -333,11 +333,11 @@ class LoadAnnotations3D(LoadAnnotations):
             self.file_client = FileClient(**self.file_client_args)
         try:
             mask_bytes = self.file_client.get(pts_instance_mask_path)
-            pts_instance_mask = np.frombuffer(mask_bytes, dtype=np.int)
+            pts_instance_mask = np.frombuffer(mask_bytes, dtype=np.int64)
         except ConnectionError:
             check_file_exist(pts_instance_mask_path)
             pts_instance_mask = np.fromfile(
-                pts_instance_mask_path, dtype=np.long)
+                pts_instance_mask_path, dtype=np.int64)
 
         results['pts_instance_mask'] = pts_instance_mask
         results['pts_mask_fields'].append('pts_instance_mask')
@@ -364,7 +364,7 @@ class LoadAnnotations3D(LoadAnnotations):
         except ConnectionError:
             check_file_exist(pts_semantic_mask_path)
             pts_semantic_mask = np.fromfile(
-                pts_semantic_mask_path, dtype=np.long)
+                pts_semantic_mask_path, dtype=np.int64)
 
         results['pts_semantic_mask'] = pts_semantic_mask
         results['pts_seg_fields'].append('pts_semantic_mask')
@@ -387,8 +387,8 @@ class LoadAnnotations3D(LoadAnnotations):
             anno = json.load(gz_file)
         
         raw_bbox_anno = anno['bounding_boxes']
-        traffic_state = np.ones([results['gt_labels_3d'].shape[0],2],dtype=np.long)*-1
-        traffic_state_mask = np.zeros([results['gt_labels_3d'].shape[0]],dtype=np.bool)
+        traffic_state = np.ones([results['gt_labels_3d'].shape[0],2],dtype=np.int64)*-1
+        traffic_state_mask = np.zeros([results['gt_labels_3d'].shape[0]],dtype=bool)
         gt_ids = list(results['ann_info']['gt_ids'])
         for i,x in enumerate(raw_bbox_anno):
             if x['class'] == 'traffic_light':
@@ -396,7 +396,7 @@ class LoadAnnotations3D(LoadAnnotations):
                 if id not in gt_ids:
                     continue
                 traffic_state[gt_ids.index(id),0] = x['state']
-                traffic_state[gt_ids.index(id),1] = np.long(x['affects_ego'])
+                traffic_state[gt_ids.index(id),1] = np.int64(x['affects_ego'])
                 traffic_state_mask[gt_ids.index(id)] = True
 
         results['traffic_state'] = traffic_state

@@ -37,7 +37,7 @@ class CustomNMSFreeCoder(BaseBBoxCoder):
 
         pass
 
-    def decode_single(self, cls_scores, bbox_preds, traj_preds):
+    def decode_single(self, cls_scores, bbox_preds, traj_preds=None):
         """Decode bboxes.
         Args:
             cls_scores (Tensor): Outputs from the classification head, \
@@ -56,7 +56,8 @@ class CustomNMSFreeCoder(BaseBBoxCoder):
         labels = indexs % self.num_classes
         bbox_index = indexs // self.num_classes
         bbox_preds = bbox_preds[bbox_index]
-        traj_preds = traj_preds[bbox_index]
+        if traj_preds is not None:
+            traj_preds = traj_preds[bbox_index]
        
         final_box_preds = denormalize_bbox(bbox_preds, self.pc_range)   
         final_scores = scores 
@@ -88,14 +89,13 @@ class CustomNMSFreeCoder(BaseBBoxCoder):
             boxes3d = final_box_preds[mask]
             scores = final_scores[mask]
             labels = final_preds[mask]
-            trajs = final_traj_preds[mask]
-
             predictions_dict = {
                 'bboxes': boxes3d,
                 'scores': scores,
                 'labels': labels,
-                'trajs': trajs
             }
+            if final_traj_preds is not None:
+                predictions_dict['trajs'] = final_traj_preds[mask]
 
         else:
             raise NotImplementedError(
@@ -117,11 +117,13 @@ class CustomNMSFreeCoder(BaseBBoxCoder):
         """
         all_cls_scores = preds_dicts['all_cls_scores'][-1]
         all_bbox_preds = preds_dicts['all_bbox_preds'][-1]
-        all_traj_preds = preds_dicts['all_traj_preds'][-1]
+        all_traj_preds = preds_dicts.get('all_traj_preds')
+        if all_traj_preds is not None:
+            all_traj_preds = all_traj_preds[-1]
         
         batch_size = all_cls_scores.size()[0]
         predictions_list = []
         for i in range(batch_size):
-            predictions_list.append(self.decode_single(all_cls_scores[i], all_bbox_preds[i], all_traj_preds[i]))
+            traj_preds = None if all_traj_preds is None else all_traj_preds[i]
+            predictions_list.append(self.decode_single(all_cls_scores[i], all_bbox_preds[i], traj_preds))
         return predictions_list
-

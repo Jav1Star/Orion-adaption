@@ -42,7 +42,7 @@ import math
 
 @DATASETS.register_module()
 class B2DOrionDataset(Custom3DDataset):
-    def __init__(self, queue_length=4, seq_mode=False, seq_split_num=1, overlap_test=False,with_velocity=True,sample_interval=5,name_mapping= None,eval_cfg = None, map_root =None,map_file=None,past_frames=2, future_frames=6,point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0] ,polyline_points_num=20,*args, eval_mode=['lane', 'det'], stage1_enable_prev_frame=False, **kwargs):
+    def __init__(self, queue_length=4, seq_mode=False, seq_split_num=1, overlap_test=False,with_velocity=True,sample_interval=5,name_mapping= None,eval_cfg = None, map_root =None,map_file=None,past_frames=2, future_frames=6,point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0] ,polyline_points_num=20,*args, eval_mode=['lane', 'det'], **kwargs):
         super().__init__(*args, **kwargs)
         self.queue_length = queue_length
         self.overlap_test = overlap_test
@@ -63,7 +63,6 @@ class B2DOrionDataset(Custom3DDataset):
         self.map_ann_file = 'data/infos'
         self.eval_cfg  = eval_cfg
         self.eval_mode = eval_mode
-        self.stage1_enable_prev_frame = bool(stage1_enable_prev_frame)
         with open(self.map_file,'rb') as f: 
             self.map_infos = pickle.load(f)
         if seq_mode:
@@ -72,8 +71,6 @@ class B2DOrionDataset(Custom3DDataset):
             self.seq_split_num = seq_split_num
             self.random_length = 0
             self._set_sequence_group_flag() # Must be called after load_annotations b/c load_annotations does sorting.
-        self.prev_index_map = self._build_prev_index_map() if self.stage1_enable_prev_frame else None
-        self.prev_frame_pipeline = self._build_prev_frame_pipeline() if self.stage1_enable_prev_frame else None
 
     def _set_sequence_group_flag(self):
         """
@@ -122,31 +119,6 @@ class B2DOrionDataset(Custom3DDataset):
         inv_pose[:3, -1] = - inv_pose[:3, :3] @ pose[:3, -1]
         return inv_pose
 
-    def _build_prev_index_map(self):
-        """关键调用点：stage1 的局部时序只看上一帧，不引入 route-stream 全局状态。"""
-        prev_index_map = [-1] * len(self.data_infos)
-        for index in range(1, len(self.data_infos)):
-            prev_info = self.data_infos[index - 1]
-            curr_info = self.data_infos[index]
-            is_same_route = prev_info['folder'] == curr_info['folder']
-            is_continuous_frame = int(prev_info['frame_idx']) + 1 == int(curr_info['frame_idx'])
-            if is_same_route and is_continuous_frame:
-                prev_index_map[index] = index - 1
-        return prev_index_map
-
-    def _build_prev_frame_pipeline(self):
-        filtered_transforms = []
-        for transform in self.pipeline.transforms:
-            if transform.__class__.__name__ == 'LoadAnnoatationVQA':
-                continue
-            filtered_transforms.append(transform)
-        return Compose(filtered_transforms)
-
-    def _get_prev_frame_index(self, index):
-        if self.prev_index_map is None:
-            return -1
-        return int(self.prev_index_map[index])
-
     def _prepare_single_frame(self, index, pipeline):
         input_dict = self.get_data_info(index)
         if input_dict is None:
@@ -158,31 +130,6 @@ class B2DOrionDataset(Custom3DDataset):
         gt_labels, gt_bboxes = self.get_map_info(index)
         example['map_gt_labels_3d'] = DC(gt_labels, cpu_only=False)
         example['map_gt_bboxes_3d'] = DC(gt_bboxes, cpu_only=True)
-        return example
-
-    def _attach_prev_frame_fields(self, example, index):
-        prev_index = self._get_prev_frame_index(index)
-        has_prev_frame = prev_index >= 0
-        if has_prev_frame:
-            prev_example = self._prepare_single_frame(prev_index, self.prev_frame_pipeline)
-            if prev_example is None:
-                return None
-        else:
-            # 关键调用点：route 首帧不跨 route 借历史，只用当前帧占位并靠 has_prev_frame 屏蔽。
-            prev_example = example
-
-        example['prev_img'] = prev_example['img']
-        example['prev_img_metas'] = prev_example['img_metas']
-        example['prev_gt_bboxes_3d'] = prev_example['gt_bboxes_3d']
-        example['prev_gt_labels_3d'] = prev_example['gt_labels_3d']
-        example['prev_map_gt_bboxes_3d'] = prev_example['map_gt_bboxes_3d']
-        example['prev_map_gt_labels_3d'] = prev_example['map_gt_labels_3d']
-        example['prev_ego_fut_trajs'] = prev_example['ego_fut_trajs']
-        example['has_prev_frame'] = DC(
-            torch.tensor([1 if has_prev_frame else 0], dtype=torch.float32),
-            stack=True,
-            cpu_only=False,
-        )
         return example
 
     def prepare_train_data(self, index):
@@ -203,11 +150,6 @@ class B2DOrionDataset(Custom3DDataset):
             example = self._prepare_single_frame(i, self.pipeline)
             if example is None:
                 return None
-            if self.stage1_enable_prev_frame:
-                example = self._attach_prev_frame_fields(example, i)
-                if example is None:
-                    return None
-            
             if self.filter_empty_gt and \
                     (example is None or ~(example['gt_labels_3d']._data != -1).any()):
                 return None

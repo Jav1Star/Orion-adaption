@@ -180,9 +180,9 @@ model = dict(
     fp16_eval=fp16_infer,
     frozen=False,
     use_lora=True,
-    tokenizer=llm_path,
-    lm_head=llm_path, # set to None if don't use llm head
-    adaption_cfg=orion_adaption_cfg,
+    tokenizer={{_base_.llm_path}},
+    lm_head={{_base_.llm_path}}, # set to None if don't use llm head
+    adaption_cfg={{_base_.orion_adaption_cfg}},
     use_gen_token = use_gen_token,
     use_diff_decoder = False, 
     img_backbone=dict(
@@ -323,7 +323,7 @@ test_pipeline = [
     dict(type="PadMultiViewImage", size_divisor=32),
     dict(type='LoadAnnoatationCriticalVQATest', 
          load_type=["critical_qa"],
-         tokenizer=llm_path, 
+         tokenizer={{_base_.llm_path}}, 
          use_gen_token=use_gen_token,
          max_length=2048,),
     dict(

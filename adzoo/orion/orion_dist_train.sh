@@ -17,12 +17,20 @@ RANK=${RANK:-0}
 WORK_DIR=$(echo ${CFG%.*} | sed -e "s/configs/work_dirs/g")/
 # Intermediate files and logs will be saved to UniAD/projects/work_dirs/
 
+# 训练默认落到 orion 环境，避免当前 shell 停在 base 环境时找不到 torch。
+DEFAULT_PYTHON_BIN="$HOME/miniconda3/envs/orion/bin/python"
+if [ -x "$DEFAULT_PYTHON_BIN" ]; then
+    PYTHON_BIN=${PYTHON_BIN:-$DEFAULT_PYTHON_BIN}
+else
+    PYTHON_BIN=${PYTHON_BIN:-$(command -v python)}
+fi
+
 if [ ! -d ${WORK_DIR}logs ]; then
     mkdir -p ${WORK_DIR}logs
 fi
 
 PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
-python -m torch.distributed.launch \
+"$PYTHON_BIN" -m torch.distributed.launch \
     --nproc_per_node=${GPUS_PER_NODE} \
     --master_addr=${MASTER_ADDR} \
     --master_port=${MASTER_PORT} \

@@ -2,6 +2,7 @@
 import collections.abc
 import functools
 import itertools
+import os
 import subprocess
 import warnings
 from collections import abc
@@ -411,6 +412,7 @@ def locations(features, stride, pad_h, pad_w):
         return locations
     
 def load_model(base_model, use_lora, frozen, lm_kwargs=dict(), fp16_infer=False):
+    base_model = os.path.expanduser(base_model)
     if fp16_infer:
         model = LlavaLlamaForCausalLM.from_pretrained(base_model, torch_dtype=torch.float16, device_map='cpu', **lm_kwargs)
         # use_lora = False

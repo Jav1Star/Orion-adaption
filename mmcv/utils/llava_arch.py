@@ -149,14 +149,34 @@ class LlavaMetaForCausalLM(ABC):
                 if i < num_images:
                     cur_image_features = image_features[cur_image_idx]
                     cur_image_idx += 1
-                    cur_new_input_embeds.append(cur_image_features)
-                    cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
-                    cur_new_input_ids.append(torch.full((cur_image_features.shape[0],), IMAGE_TOKEN_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
                     if adalava_controller is not None:
                         if adalava_controller.sceneaware_enabled:
+                            image_prefix_len = int(adalava_controller.sceneaware_image_prefix_len)
+                            if image_prefix_len <= 0 or image_prefix_len > cur_image_features.shape[0]:
+                                raise ValueError(
+                                    "scene-aware image prefix length is invalid: "
+                                    f"{image_prefix_len} vs image token count {cur_image_features.shape[0]}"
+                                )
+                            # 关键调用点：4 个 scene-aware token 固定插在 scene queries + history queries 后面。
+                            cur_new_input_embeds.append(cur_image_features[:image_prefix_len])
+                            cur_new_labels.append(
+                                torch.full(
+                                    (image_prefix_len,),
+                                    IGNORE_INDEX,
+                                    device=cur_labels.device,
+                                    dtype=cur_labels.dtype,
+                                )
+                            )
+                            cur_new_input_ids.append(
+                                torch.full(
+                                    (image_prefix_len,),
+                                    IMAGE_TOKEN_INDEX,
+                                    device=cur_input_ids.device,
+                                    dtype=cur_input_ids.dtype,
+                                )
+                            )
                             # 关键调用点：stage1 训练与闭环推理共用 scene-aware token 注入顺序。
                             sceneaware_embeds = adalava_controller.get_sceneaware_embeddings(
-                                cur_image_features.unsqueeze(0),
                                 sample_idx=batch_idx,
                             ).squeeze(0)
                             cur_new_input_embeds.append(sceneaware_embeds)
@@ -180,6 +200,41 @@ class LlavaMetaForCausalLM(ABC):
                                     dtype=cur_input_ids.dtype,
                                 )
                             )
+                            cur_new_input_embeds.append(cur_image_features[image_prefix_len:])
+                            cur_new_labels.append(
+                                torch.full(
+                                    (cur_image_features.shape[0] - image_prefix_len,),
+                                    IGNORE_INDEX,
+                                    device=cur_labels.device,
+                                    dtype=cur_labels.dtype,
+                                )
+                            )
+                            cur_new_input_ids.append(
+                                torch.full(
+                                    (cur_image_features.shape[0] - image_prefix_len,),
+                                    IMAGE_TOKEN_INDEX,
+                                    device=cur_input_ids.device,
+                                    dtype=cur_input_ids.dtype,
+                                )
+                            )
+                        else:
+                            cur_new_input_embeds.append(cur_image_features)
+                            cur_new_labels.append(
+                                torch.full(
+                                    (cur_image_features.shape[0],),
+                                    IGNORE_INDEX,
+                                    device=cur_labels.device,
+                                    dtype=cur_labels.dtype,
+                                )
+                            )
+                            cur_new_input_ids.append(
+                                torch.full(
+                                    (cur_image_features.shape[0],),
+                                    IMAGE_TOKEN_INDEX,
+                                    device=cur_input_ids.device,
+                                    dtype=cur_input_ids.dtype,
+                                )
+                            )
                         # 关键调用点：query token 作为内部 embedding 插入，不要求外部 prompt 显式携带特殊 token。
                         budget_query_embed, path_query_embed = adalava_controller.get_query_embeddings(
                             device=cur_image_features.device,
@@ -197,6 +252,33 @@ class LlavaMetaForCausalLM(ABC):
                             torch.full(
                                 (1,),
                                 ADALAVA_BUDGET_TOKEN_INDEX,
+                                device=cur_input_ids.device,
+                                dtype=cur_input_ids.dtype,
+                            )
+                        )
+                        # 这里的 path query embed 也必须补一枚对应 token，保证 embed/label/input_ids 三条序列严格等长。
+                        cur_new_input_ids.append(
+                            torch.full(
+                                (1,),
+                                ADALAVA_PATH_TOKEN_INDEX,
+                                device=cur_input_ids.device,
+                                dtype=cur_input_ids.dtype,
+                            )
+                        )
+                    else:
+                        cur_new_input_embeds.append(cur_image_features)
+                        cur_new_labels.append(
+                            torch.full(
+                                (cur_image_features.shape[0],),
+                                IGNORE_INDEX,
+                                device=cur_labels.device,
+                                dtype=cur_labels.dtype,
+                            )
+                        )
+                        cur_new_input_ids.append(
+                            torch.full(
+                                (cur_image_features.shape[0],),
+                                IMAGE_TOKEN_INDEX,
                                 device=cur_input_ids.device,
                                 dtype=cur_input_ids.dtype,
                             )
