@@ -46,7 +46,15 @@ def _update_iter_based_runtime_schedule(cfg, train_dataset):
     cfg.num_iters_per_epoch = num_iters_per_epoch
     cfg.runner.max_iters = num_epochs * num_iters_per_epoch
     if cfg.get('checkpoint_config', None) is not None:
-        cfg.checkpoint_config.interval = num_iters_per_epoch
+        checkpoint_interval = cfg.get('checkpoint_interval', None)
+        # 关键调用点：显式保存间隔优先于默认按 epoch 保存，避免训练入口覆盖脚本传参。
+        if checkpoint_interval is None:
+            checkpoint_interval = num_iters_per_epoch
+        else:
+            checkpoint_interval = int(checkpoint_interval)
+            if checkpoint_interval <= 0:
+                raise ValueError('checkpoint_interval must be a positive integer')
+        cfg.checkpoint_config.interval = checkpoint_interval
     if cfg.get('evaluation', None) is not None:
         cfg.evaluation.interval = num_iters_per_epoch * (num_epochs + 1)
     if cfg.data.get('shuffler_sampler', None) is not None and 'num_iters_to_seq' in cfg.data.shuffler_sampler:
@@ -228,6 +236,8 @@ def main():
         f'IterBased runtime schedule: num_iters_per_epoch={cfg.get("num_iters_per_epoch", "n/a")}, '
         f'max_iters={cfg.runner.max_iters}'
     )
+    if cfg.get('checkpoint_config', None) is not None:
+        logger.info(f'Checkpoint interval: {cfg.checkpoint_config.interval} iters')
     if len(cfg.workflow) == 2:
         val_dataset = copy.deepcopy(cfg.data.val)
         # in case we use a dataset wrapper

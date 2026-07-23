@@ -940,8 +940,11 @@ class LoadAnnoatationVQA():
         if self.base_desc_path is not None:
             image_path = Path(results['img_filename'][0])
             json_directory = image_path.parent.parent.parent.stem 
-
-            with open(self.base_desc_path+'/'+json_directory +'/'+ f'{image_path.stem}.json', 'r') as f:
+            desc_path = Path(self.base_desc_path) / json_directory / f'{image_path.stem}.json'
+            # 关键调用点：chat-B2D 描述文件偶发缺失时直接跳过该条描述监督，避免 DataLoader 因坏样本中断整轮训练。
+            if not desc_path.exists():
+                return sources
+            with open(desc_path, 'r') as f:
                 desc = json.load(f)
             sources.extend(desc)
         return sources  
@@ -1046,6 +1049,9 @@ class LoadAnnoatationVQA():
                     sources = planning_qa + sources
   
         vqa_anno = [item for pair in sources for item in pair]
+        # 关键调用点：当前帧既没有 chat-B2D 描述、也没有可生成的在线 QA 时，直接跳过该样本。
+        if len(vqa_anno) == 0:
+            return None
         if self.use_gen_token:
             num_new_tokens = self.tokenizer.add_tokens(["<waypoint_ego>"], special_tokens = True)
         vqa_anno[0]['value'] = DEFAULT_IMAGE_TOKEN + '\n' + prompt + vqa_anno[0]['value']  

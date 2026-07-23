@@ -456,6 +456,21 @@ class OrionHead(AnchorFreeHead):
         self.memory_scene_tokens = None
         self.his_memory_canbus_len = None
 
+    def _detach_memory_bank_state(self):
+        # 关键调用点：temporal memory bank 只作为跨 iter 的缓存状态复用，
+        # 这里统一断开计算图，避免上一轮 autograd graph 通过 cache 被带到下一轮。
+        self.memory_embedding = self.memory_embedding.detach()
+        self.memory_reference_point = self.memory_reference_point.detach()
+        self.memory_timestamp = self.memory_timestamp.detach()
+        self.memory_egopose = self.memory_egopose.detach()
+        self.memory_velo = self.memory_velo.detach()
+        self.sample_time = self.sample_time.detach()
+        self.memory_canbus = self.memory_canbus.detach()
+        self.his_memory_canbus_len = self.his_memory_canbus_len.detach()
+        if self.use_memory:
+            self.memory_scene_query = self.memory_scene_query.detach()
+            self.scene_memory_timestamp = self.scene_memory_timestamp.detach()
+
     def pre_update_memory(self, img_metas, data):
         B = data['img_feats'].size(0)
         # refresh the memory when the scene changes
@@ -474,6 +489,7 @@ class OrionHead(AnchorFreeHead):
                 self.memory_scene_query = data['img_feats'].new_zeros(B, self.scence_memory_len, self.embed_dims)
                 self.scene_memory_timestamp = data['img_feats'].new_zeros(B, self.scence_memory_len, 1)      
         else:
+            self._detach_memory_bank_state()
             self.memory_timestamp += data['timestamp'].unsqueeze(-1).unsqueeze(-1)
             self.sample_time += data['timestamp']
             x = (torch.abs(self.sample_time) < 2.0)
@@ -523,7 +539,7 @@ class OrionHead(AnchorFreeHead):
         rec_timestamp = topk_gather(rec_timestamp, topk_indexes)
         rec_reference_points = topk_gather(rec_reference_points, topk_indexes).detach()
         rec_memory = topk_gather(out_memory, topk_indexes).detach()
-        rec_ego_pose = topk_gather(rec_ego_pose, topk_indexes)
+        rec_ego_pose = topk_gather(rec_ego_pose, topk_indexes).detach()
         rec_velo = topk_gather(rec_velo, topk_indexes).detach()
         self.memory_embedding = torch.cat([rec_memory, self.memory_embedding], dim=1)
         self.memory_timestamp = torch.cat([rec_timestamp, self.memory_timestamp], dim=1)
@@ -533,7 +549,7 @@ class OrionHead(AnchorFreeHead):
         self.memory_egopose= torch.cat([rec_ego_pose, self.memory_egopose], dim=1)
         self.memory_reference_point = torch.cat([rec_reference_points, self.memory_reference_point], dim=1)
         self.memory_velo = torch.cat([rec_velo, self.memory_velo], dim=1)
-        self.memory_canbus = torch.cat([rec_can_bus, self.memory_canbus], dim=1)
+        self.memory_canbus = torch.cat([rec_can_bus.detach(), self.memory_canbus], dim=1)
         self.his_memory_canbus_len += 1 
         self.memory_reference_point = transform_reference_points(self.memory_reference_point, data['ego_pose'], reverse=False)
         self.memory_timestamp -= data['timestamp'].unsqueeze(-1).unsqueeze(-1)
@@ -545,6 +561,7 @@ class OrionHead(AnchorFreeHead):
         self.memory_scene_tokens = [meta['scene_token'] for meta in img_metas]
         if self.use_memory:
             self.memory_scene_query = torch.cat([history_query.detach(), self.memory_scene_query], dim=1)
+        self._detach_memory_bank_state()
         return out_memory
 
     def temporal_alignment(self, query_pos, tgt, reference_points):

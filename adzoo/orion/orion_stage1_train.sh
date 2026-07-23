@@ -17,7 +17,7 @@ SAMPLES_PER_GPU=${SAMPLES_PER_GPU:-}
 WORKERS_PER_GPU=${WORKERS_PER_GPU:-4}
 NUM_EPOCHS=${NUM_EPOCHS:-}
 LOG_INTERVAL=${LOG_INTERVAL:-10}
-CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-}
+CHECKPOINTS_INTERVAL=${CHECKPOINTS_INTERVAL:-}
 
 DEFAULT_PYTHON_BIN="$HOME/miniconda3/envs/$CONDA_ENV/bin/python"
 if [ ! -x "$DEFAULT_PYTHON_BIN" ]; then
@@ -44,8 +44,9 @@ CFG_OPTIONS=(
 if [ -n "$SAMPLES_PER_GPU" ]; then
     CFG_OPTIONS+=("data.samples_per_gpu=$SAMPLES_PER_GPU")
 fi
-if [ -n "$CHECKPOINT_INTERVAL" ]; then
-    CFG_OPTIONS+=("checkpoint_config.interval=$CHECKPOINT_INTERVAL")
+if [ -n "$CHECKPOINTS_INTERVAL" ]; then
+    # 关键调用点：显式 checkpoint iter 间隔统一走 runtime override，避免被 train.py 默认按 epoch 回填覆盖。
+    CFG_OPTIONS+=("checkpoint_interval=$CHECKPOINTS_INTERVAL")
 fi
 if [ -n "$NUM_EPOCHS" ]; then
     CFG_OPTIONS+=("num_epochs=$NUM_EPOCHS")

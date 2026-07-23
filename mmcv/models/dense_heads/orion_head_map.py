@@ -280,6 +280,16 @@ class OrionHeadM(AnchorFreeHead):
         self.memory_mask = None
         self.memory_scene_tokens = None
 
+    def _detach_memory_bank_state(self):
+        # 关键调用点：map temporal memory 只保存跨 iter 状态，
+        # 每轮复用前后都断开计算图，避免缓存把历史 graph 留在 GPU 上。
+        self.memory_embedding = self.memory_embedding.detach()
+        self.memory_reference_point = self.memory_reference_point.detach()
+        self.memory_timestamp = self.memory_timestamp.detach()
+        self.memory_egopose = self.memory_egopose.detach()
+        self.sample_time = self.sample_time.detach()
+        self.memory_mask = self.memory_mask.detach()
+
     def pre_update_memory(self, img_metas, data):
         B = data['img_feats'].size(0)
         # refresh the memory when the scene changes
@@ -293,6 +303,7 @@ class OrionHeadM(AnchorFreeHead):
             x = self.sample_time.to(data['img_feats'].dtype)
             self.memory_scene_tokens = ['' for meta in img_metas]
         else:
+            self._detach_memory_bank_state()
             self.memory_timestamp += data['timestamp'].unsqueeze(-1).unsqueeze(-1)
             self.sample_time += data['timestamp']
             x = (torch.abs(self.sample_time) < 2.0)
@@ -319,7 +330,7 @@ class OrionHeadM(AnchorFreeHead):
         rec_timestamp = topk_gather(rec_timestamp, topk_indexes)
         rec_reference_points = topk_gather(rec_reference_points, topk_indexes).detach()
         rec_memory = topk_gather(out_memory, topk_indexes).detach()
-        rec_ego_pose = topk_gather(rec_ego_pose, topk_indexes)
+        rec_ego_pose = topk_gather(rec_ego_pose, topk_indexes).detach()
 
         self.memory_embedding = torch.cat([rec_memory, self.memory_embedding], dim=1)
         self.memory_timestamp = torch.cat([rec_timestamp, self.memory_timestamp], dim=1)
@@ -331,6 +342,7 @@ class OrionHeadM(AnchorFreeHead):
         self.sample_time -= data['timestamp']
         self.memory_egopose = data['ego_pose'].unsqueeze(1) @ self.memory_egopose
         self.memory_scene_tokens = [meta['scene_token'] for meta in img_metas]
+        self._detach_memory_bank_state()
         
         return out_memory
     

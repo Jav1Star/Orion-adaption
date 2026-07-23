@@ -427,8 +427,10 @@ def load_model(base_model, use_lora, frozen, lm_kwargs=dict(), fp16_infer=False,
         device_map='cpu',
         **lm_kwargs)
     
-    if frozen_dtype is None:
-        model.gradient_checkpointing_enable()
+    # if not fp16_infer:
+    #     # 关键调用点：bf16 训练同样需要开启 gradient checkpointing，
+    #     # 否则 LLM 激活会整段常驻显存，stage1 很容易在长序列上冲到 90G+。
+    #     model.gradient_checkpointing_enable()
 
     if frozen:
         model.eval()

@@ -157,6 +157,7 @@ num_gpus = 32
 batch_size = 4
 num_iters_per_epoch = 234769 // (num_gpus * batch_size)
 num_epochs = 6
+checkpoint_interval = None  # None 表示默认按每个 epoch 的 iter 数保存一次 checkpoint。
 use_gen_token = False
 collect_keys = ['lidar2img', 'cam_intrinsic', 'timestamp', 'ego_pose', 'ego_pose_inv', 'command']
 pretrain = True # stage1 pretrain, False for stage 2 finetune

@@ -64,7 +64,7 @@ import matplotlib.pyplot as plt
 from mmcv.utils.misc import memory_refresh
 from mmcv.models.utils import build_transformer
 from mmcv.models.builder import HEADS, build_loss 
-from mmcv.models.losses.orion_stage1_aux_loss import OrionStage1AuxLossComputer
+from mmcv.models.losses.orion_stage1_aux_loss import OrionStage1AuxLossComputer, compute_stage1_bal_loss
 from mmcv.models.utils.vis_utils import format_bbox, show_multicam_bboxes, draw_ld_vis
 @DETECTORS.register_module()
 class Orion(MVXTwoStageDetector):
@@ -215,12 +215,14 @@ class Orion(MVXTwoStageDetector):
         self.adaption_sample_interval = int(self.adaption_cfg.get('sample_interval', 5))
         self.adaption_stage1_enabled = self.adaption_train_stage == 'stage1'
         self.adaption_stage1_aux_enabled = bool(self.adaption_cfg.get('stage1_aux_enabled', False))
+        self.adaption_stage1_aux_div_enabled = bool(self.adaption_cfg.get('stage1_aux_div_enabled', False))
         self.adaption_stage1_aux_div_margin = float(self.adaption_cfg.get('stage1_aux_div_margin', 0.05))
         self.adaption_stage1_aux_bal_epsilon = float(self.adaption_cfg.get('stage1_aux_bal_epsilon', 0.05))
         self.adaption_stage1_aux_div_ratio_start = float(self.adaption_cfg.get('stage1_aux_div_ratio_start', 0.01))
         self.adaption_stage1_aux_div_ratio_end = float(self.adaption_cfg.get('stage1_aux_div_ratio_end', 0.05))
         self.adaption_stage1_aux_div_warmup_steps = int(self.adaption_cfg.get('stage1_aux_div_warmup_steps', 1000))
         self.adaption_stage1_aux_bal_ratio = float(self.adaption_cfg.get('stage1_aux_bal_ratio', 0.01))
+        self.adaption_stage1_aux_div_queue_size = int(self.adaption_cfg.get('stage1_aux_div_queue_size', 32))
         self.adaption_stage1_aux_loss_computer = None
         if self.adaption_enabled:
             if lm_head is None:
@@ -236,6 +238,10 @@ class Orion(MVXTwoStageDetector):
                 )
             if self.adaption_stage1_aux_div_warmup_steps < 0:
                 raise ValueError(f"stage1_aux_div_warmup_steps must be >= 0, got {self.adaption_stage1_aux_div_warmup_steps}")
+            if self.adaption_stage1_aux_div_queue_size <= 0:
+                raise ValueError(
+                    f"stage1_aux_div_queue_size must be > 0, got {self.adaption_stage1_aux_div_queue_size}"
+                )
         if lm_head is not None:
             lm_kwargs = dict(
                 use_gen_token=use_gen_token,
@@ -279,8 +285,15 @@ class Orion(MVXTwoStageDetector):
                         self.pts_bbox_head.num_memory if self.pts_bbox_head.use_memory else 0
                     ),
                 )
-                if self.adaption_stage1_enabled and self.adaption_stage1_aux_enabled:
-                    self.adaption_stage1_aux_loss_computer = OrionStage1AuxLossComputer()
+                if (
+                    self.adaption_stage1_enabled
+                    and self.adaption_stage1_aux_enabled
+                    and self.adaption_stage1_aux_div_enabled
+                ):
+                    # 关键调用点：stage1 div 的跨 batch 历史只归 aux loss 模块维护，避免把 queue 状态分散到 assigner。
+                    self.adaption_stage1_aux_loss_computer = OrionStage1AuxLossComputer(
+                        div_queue_size=self.adaption_stage1_aux_div_queue_size
+                    )
         if use_gen_token:
             add_special_token([EGO_WAYPOINT_TOKEN], tokenizer = self.tokenizer, model = self.lm_head)
             self.lm_head.config.waypoint_token_idx = self.tokenizer(EGO_WAYPOINT_TOKEN, add_special_tokens=False).input_ids[0]
@@ -567,9 +580,28 @@ class Orion(MVXTwoStageDetector):
         return float(ratio_start + 0.5 * (1.0 - math.cos(math.pi * progress)) * (ratio_end - ratio_start))
 
     def _build_stage1_aux_loss_dict(self) -> dict:
-        if self.adaption_assigner is None or self.adaption_stage1_aux_loss_computer is None:
+        if self.adaption_assigner is None or not self.adaption_stage1_aux_enabled:
             return {}
         runtime_signals = self.adaption_assigner.get_stage1_aux_training_signals()
+        bal_losses = compute_stage1_bal_loss(
+            path_mask_st=runtime_signals['path_mask_st'],
+            budget_values=runtime_signals['budget_values'],
+            num_prefix_layers=runtime_signals['num_prefix_layers'],
+            num_hidden_layers=runtime_signals['num_hidden_layers'],
+            bal_epsilon=self.adaption_stage1_aux_bal_epsilon,
+        )
+        lambda_bal = float(self.adaption_stage1_aux_bal_ratio)
+        log_tensor = runtime_signals['budget_values'].mean()
+        loss_dict = {
+            'loss_bal': torch.nan_to_num(bal_losses['bal_loss'] * lambda_bal),
+            'stage1_aux_bal_raw': torch.nan_to_num(bal_losses['bal_loss']),
+            'stage1_aux_lambda_bal': log_tensor.new_tensor(lambda_bal),
+            'stage1_aux_target_sub_budget': torch.nan_to_num(bal_losses['target_sub_budget']),
+            'stage1_aux_path_mask_hard_mean': torch.nan_to_num(runtime_signals['path_mask_hard'].float().mean()),
+            'stage1_aux_budget_mean': torch.nan_to_num(runtime_signals['budget_values'].float().mean()),
+        }
+        if self.adaption_stage1_aux_loss_computer is None:
+            return loss_dict
         aux_losses = self.adaption_stage1_aux_loss_computer.compute(
             language_inputs=runtime_signals['language_inputs'],
             language_ids=runtime_signals['language_ids'],
@@ -584,21 +616,17 @@ class Orion(MVXTwoStageDetector):
             bal_epsilon=self.adaption_stage1_aux_bal_epsilon,
         )
         lambda_div = self._compute_stage1_aux_lambda_div(self.adaption_assigner.stage1_budget_runtime_iter)
-        lambda_bal = float(self.adaption_stage1_aux_bal_ratio)
         ref_tensor = aux_losses['div_loss']
-        return {
-            'loss_div': torch.nan_to_num(aux_losses['div_loss'] * lambda_div),
-            'loss_bal': torch.nan_to_num(aux_losses['bal_loss'] * lambda_bal),
-            'stage1_aux_div_raw': torch.nan_to_num(aux_losses['div_loss']),
-            'stage1_aux_bal_raw': torch.nan_to_num(aux_losses['bal_loss']),
-            'stage1_aux_lambda_div': ref_tensor.new_tensor(lambda_div),
-            'stage1_aux_lambda_bal': ref_tensor.new_tensor(lambda_bal),
-            'stage1_aux_scene_similarity_mean': torch.nan_to_num(aux_losses['scene_similarity_mean']),
-            'stage1_aux_path_similarity_mean': torch.nan_to_num(aux_losses['path_similarity_mean']),
-            'stage1_aux_target_sub_budget': torch.nan_to_num(aux_losses['target_sub_budget']),
-            'stage1_aux_path_mask_hard_mean': torch.nan_to_num(aux_losses['path_mask_hard_mean']),
-            'stage1_aux_budget_mean': torch.nan_to_num(aux_losses['budget_mean']),
-        }
+        loss_dict.update(
+            loss_div=torch.nan_to_num(aux_losses['div_loss'] * lambda_div),
+            stage1_aux_div_raw=torch.nan_to_num(aux_losses['div_loss']),
+            stage1_aux_lambda_div=ref_tensor.new_tensor(lambda_div),
+            stage1_aux_scene_similarity_mean=torch.nan_to_num(aux_losses['scene_similarity_mean']),
+            stage1_aux_path_similarity_mean=torch.nan_to_num(aux_losses['path_similarity_mean']),
+            stage1_aux_div_ref_count=torch.nan_to_num(aux_losses['div_ref_count']),
+            stage1_aux_div_queue_fill_ratio=torch.nan_to_num(aux_losses['div_queue_fill_ratio']),
+        )
+        return loss_dict
 
     def _build_stage1_runtime_log_dict(self) -> dict:
         """记录 stage1 的 budget / path 运行态统计，便于直接看日志。"""
