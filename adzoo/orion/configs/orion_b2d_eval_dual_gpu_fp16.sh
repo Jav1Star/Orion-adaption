@@ -13,7 +13,7 @@ SAVE_PATH=${SAVE_PATH:-$OUTDIR_ROOT/records}
 ORION_EVAL_VISUALIZATION=${ORION_EVAL_VISUALIZATION:-false}
 
 ROUTES=${ROUTES:-~/Orion-adaption/Bench2Drive/leaderboard/data/bench2drive220.xml}
-AGENT_CONFIG_PATH=${AGENT_CONFIG_PATH:-~/Orion-adaption/adzoo/orion/configs/orion_stage3_agent.py}
+AGENT_CONFIG_PATH=${AGENT_CONFIG_PATH:-~/Orion-adaption/adzoo/orion/configs/orion_stage3_agent_fp16.py}
 
 CARLA_ROOT=${CARLA_ROOT:-/dataset/carla0915}
 PYTHON_BIN=${PYTHON_BIN:-~/miniconda3/envs/orion/bin/python}

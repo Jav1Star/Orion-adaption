@@ -72,12 +72,6 @@ def is_failed_status(status):
     return isinstance(status, str) and status.strip().startswith("Failed")
 
 
-def should_skip_route(result_file, resume_enabled):
-    if not resume_enabled or not result_file.exists():
-        return False
-    return not is_failed_status(get_route_status(result_file))
-
-
 def get_route_status(result_file):
     if not result_file.exists():
         return None
@@ -88,17 +82,25 @@ def get_route_status(result_file):
         return None
 
     checkpoint = data.get("_checkpoint", {})
-    global_record = checkpoint.get("global_record", {})
-    status = global_record.get("status")
-    if isinstance(status, str):
-        return status.strip()
-
+    # 单条 route 结果里，更具体的失败原因通常记录在 records[0].status。
     records = checkpoint.get("records", [])
     if records:
         record_status = records[0].get("status")
         if isinstance(record_status, str):
             return record_status.strip()
+
+    global_record = checkpoint.get("global_record", {})
+    status = global_record.get("status")
+    if isinstance(status, str):
+        return status.strip()
     return None
+
+
+def should_queue_route(result_file):
+    # 这是最小实验版：只补跑 TickRuntime 和缺失结果的 route。
+    if not result_file.exists():
+        return True
+    return get_route_status(result_file) == "Failed - TickRuntime"
 
 
 def cleanup_worker_ports(port, tm_port):
@@ -197,8 +199,10 @@ def check_and_kill_dead_job(job, progress_bar):
 
 def main():
     routes_file = os.environ["ROUTES"]
-    checkpoint_endpoint = Path(os.environ["CHECKPOINT_ENDPOINT"]).resolve()
-    save_path = Path(os.environ["SAVE_PATH"]).resolve()
+    outdir_root = Path(os.environ["OUTDIR_ROOT"]).resolve()
+    # 所有闭环产物统一落在 outdir_root 下，便于做多次实验隔离。
+    checkpoint_endpoint = outdir_root / "orion_eval.json"
+    save_path = outdir_root / "records"
     leaderboard_root = Path(os.environ["LEADERBOARD_ROOT"]).resolve()
     team_agent = os.environ["TEAM_AGENT"]
     team_config = os.environ["TEAM_CONFIG"]
@@ -208,16 +212,13 @@ def main():
     challenge_track = os.environ.get("CHALLENGE_TRACK_CODENAME", "SENSORS")
     base_port = int(os.environ.get("PORT", "30000"))
     base_tm_port = int(os.environ.get("TM_PORT", "50000"))
-    resume_enabled = parse_bool_env("RESUME", default=True)
     visualization_enabled = parse_bool_env("ORION_EVAL_VISUALIZATION", default=False)
 
-    route_root = checkpoint_endpoint.parent / "routes"
+    route_root = outdir_root / "routes"
     result_dir = route_root / "res"
     out_dir = route_root / "out"
     err_dir = route_root / "err"
-    directories = [result_dir, out_dir, err_dir]
-    if visualization_enabled:
-        directories.append(save_path)
+    directories = [outdir_root, result_dir, out_dir, err_dir, save_path]
     for directory in directories:
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -253,16 +254,17 @@ def main():
                 route_save_path = save_path / route_id
                 route_save_path.mkdir(parents=True, exist_ok=True)
 
-            if should_skip_route(result_file, resume_enabled):
+            # 这是实验版筛选逻辑：只入队 TickRuntime 和缺失结果，其余 route 直接跳过。
+            if not should_queue_route(result_file):
                 route_result_files.append(str(result_file))
                 route_status = get_route_status(result_file)
                 if route_status is not None:
                     log_message(
                         progress_bar,
-                        f"[skip] route={route_id} status={route_status} result={result_file}",
+                        f"[skip] route={route_id} status={route_status}",
                     )
                 else:
-                    log_message(progress_bar, f"[skip] route={route_id} result={result_file}")
+                    log_message(progress_bar, f"[skip] route={route_id} status=unknown")
                 progress_bar.update(1)
                 refresh_progress(
                     progress_bar,
@@ -271,6 +273,11 @@ def main():
                 )
                 loop_progress = True
                 continue
+            route_status = get_route_status(result_file)
+            log_message(
+                progress_bar,
+                f"[queue] route={route_id} status={route_status or 'missing'}",
+            )
 
             command = [
                 sys.executable,

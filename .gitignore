@@ -12,3 +12,6 @@ __pycache__/
 *.pth
 *.bin
 *.model
+*.npz
+*.tar.gz
+*.gz
