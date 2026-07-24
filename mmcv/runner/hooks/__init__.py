@@ -3,6 +3,7 @@ from .optimizer import (
     Fp16OptimizerHook,
     GradientCumulativeOptimizerHook,
     OptimizerHook,
+    OrionStage2GRPOOptimizerHook,
 )
 from .sampler_seed import DistSamplerSeedHook
 from .hook import HOOKS, Hook

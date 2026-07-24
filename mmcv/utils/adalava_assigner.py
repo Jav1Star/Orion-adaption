@@ -149,6 +149,7 @@ class OrionBudgetAssigner(nn.Module):
             )
         self.train_stage = train_stage
         self.stage1_enabled = str(train_stage).strip().lower() == "stage1"
+        self.stage2_enabled = str(train_stage).strip().lower() == "stage2"
         self.budget_min = resolve_budget_min(
             num_prefix_layers=self.num_prefix_layers,
             num_hidden_layers=self.num_hidden_layers,
@@ -171,7 +172,7 @@ class OrionBudgetAssigner(nn.Module):
         self.budget_query_embed = nn.Parameter(torch.empty(1, self.hidden_size))
         self.path_query_embed = nn.Parameter(torch.empty(1, self.hidden_size))
         self.budget_scheduler = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.Linear(self.hidden_size * 5, self.hidden_size),
             nn.SiLU(),
             nn.Linear(self.hidden_size, self.budget_num_actions),
         )
@@ -206,6 +207,16 @@ class OrionBudgetAssigner(nn.Module):
         self.sceneaware_history_max_len = 2 * self.sceneaware_sample_interval + 1
         self.stage1_budget_total_iters = 0
         self.stage1_budget_runtime_iter = 0
+        self.forced_budget_value = None
+        self.forced_budget_action_ids = None
+        self.stage2_budget_explore_enable = False
+        self.stage2_budget_explore_temp_start = 1.0
+        self.stage2_budget_explore_temp_end = 1.0
+        self.stage2_budget_explore_eps_start = 0.0
+        self.stage2_budget_explore_eps_end = 0.0
+        self.stage2_budget_explore_anneal_ratio = 0.0
+        self.stage2_budget_explore_global_step = 0
+        self.stage2_budget_explore_total_steps = None
 
         self._reset_parameters()
         self.reset_runtime_state()
@@ -236,12 +247,70 @@ class OrionBudgetAssigner(nn.Module):
         self.runtime_language_inputs_mask = None
         self.path_mask_st = None
         self.path_mask_hard = None
+        self.budget_action_logits = None
+        self.budget_action_hard = None
+        self.budget_action_ids = None
+        self.budget_query_feat_std = None
 
     def set_stage1_budget_total_iters(self, total_iters: int):
         self.stage1_budget_total_iters = int(total_iters)
 
     def advance_stage1_budget_runtime_iter(self):
         self.stage1_budget_runtime_iter += 1
+
+    def set_forced_budget_value(self, forced_budget_value: Optional[float]):
+        """采集 reference 时固定预算，避免在线调度器参与。"""
+        if forced_budget_value is None:
+            self.forced_budget_value = None
+            return
+        forced_budget_value = float(forced_budget_value)
+        if forced_budget_value < self.budget_min or forced_budget_value > 1.0:
+            raise ValueError(
+                f"forced_budget_value must be in [{self.budget_min:.6f}, 1.0], got {forced_budget_value}"
+            )
+        self.forced_budget_value = forced_budget_value
+
+    def set_forced_budget_action_ids(self, forced_budget_action_ids: Optional[torch.Tensor]):
+        """stage2 rollout 固定离散预算动作，使 reward 对比只来自预算选择。"""
+        self.forced_budget_action_ids = forced_budget_action_ids
+
+    def configure_stage2_budget_exploration(
+        self,
+        enabled: bool,
+        temp_start: float,
+        temp_end: float,
+        eps_start: float,
+        eps_end: float,
+        anneal_ratio: float,
+    ):
+        self.stage2_budget_explore_enable = bool(enabled)
+        self.stage2_budget_explore_temp_start = float(temp_start)
+        self.stage2_budget_explore_temp_end = float(temp_end)
+        self.stage2_budget_explore_eps_start = float(eps_start)
+        self.stage2_budget_explore_eps_end = float(eps_end)
+        self.stage2_budget_explore_anneal_ratio = float(anneal_ratio)
+
+    def set_stage2_budget_exploration_progress(self, global_step: int, total_steps: Optional[int]):
+        self.stage2_budget_explore_global_step = int(max(global_step, 0))
+        self.stage2_budget_explore_total_steps = None if total_steps is None else int(max(total_steps, 1))
+
+    def resolve_stage2_budget_exploration(self) -> Dict[str, float]:
+        enabled = bool(self.stage2_budget_explore_enable) and self.training and self.stage2_enabled
+        if not enabled:
+            return {"enabled": 0.0, "temperature": 1.0, "epsilon": 0.0}
+        total_steps = self.stage2_budget_explore_total_steps
+        if total_steps is None:
+            progress = 0.0
+        else:
+            anneal_steps = max(1, int(math.ceil(float(total_steps) * self.stage2_budget_explore_anneal_ratio)))
+            progress = min(max(float(self.stage2_budget_explore_global_step) / float(anneal_steps), 0.0), 1.0)
+        temperature = self.stage2_budget_explore_temp_start + progress * (
+            self.stage2_budget_explore_temp_end - self.stage2_budget_explore_temp_start
+        )
+        epsilon = self.stage2_budget_explore_eps_start + progress * (
+            self.stage2_budget_explore_eps_end - self.stage2_budget_explore_eps_start
+        )
+        return {"enabled": 1.0, "temperature": float(temperature), "epsilon": float(epsilon)}
 
     def _compute_stage1_curriculum_min(self) -> float:
         if self.stage1_budget_curriculum_warmup_steps <= 0:
@@ -892,6 +961,55 @@ class OrionBudgetAssigner(nn.Module):
         batch_indices = torch.arange(hidden_states.shape[0], device=hidden_states.device)
         return hidden_states[batch_indices, positions]
 
+    def _build_budget_scheduler_inputs(self, hidden_states, budget_hidden):
+        # 关键调用点：stage2 对齐 SimLingo，budget_scheduler 直接消费 query 与 scene-aware token 特征。
+        if self.sceneaware_token_positions is None:
+            raise ValueError("scene-aware token positions must be prepared before budget scheduler")
+        batch_indices = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+        sceneaware_positions = self.sceneaware_token_positions.to(hidden_states.device)
+        sceneaware_hidden = hidden_states[batch_indices[:, None], sceneaware_positions].reshape(
+            hidden_states.shape[0], -1
+        )
+        scheduler_inputs = torch.cat([budget_hidden, sceneaware_hidden], dim=-1)
+        self.budget_query_feat_std = scheduler_inputs.float().std(dim=0, unbiased=False).mean()
+        return scheduler_inputs
+
+    def _decode_stage2_budget_actions(self, budget_logits: torch.Tensor) -> Dict[str, torch.Tensor]:
+        action_probs = F.softmax(budget_logits.float(), dim=-1)
+        explore_cfg = self.resolve_stage2_budget_exploration()
+        if bool(explore_cfg["enabled"] > 0.0):
+            temperature = max(float(explore_cfg["temperature"]), 1e-6)
+            epsilon = min(max(float(explore_cfg["epsilon"]), 0.0), 1.0)
+            sample_probs = F.softmax(budget_logits.float() / temperature, dim=-1)
+            action_ids = torch.distributions.Categorical(probs=sample_probs).sample()
+            if epsilon > 0.0:
+                random_mask = torch.rand_like(action_ids.float()) < epsilon
+                random_ids = torch.randint(
+                    low=0,
+                    high=self.budget_num_actions,
+                    size=action_ids.shape,
+                    device=action_ids.device,
+                    dtype=action_ids.dtype,
+                )
+                action_ids = torch.where(random_mask, random_ids, action_ids)
+            probs_for_st = sample_probs
+        else:
+            action_ids = budget_logits.argmax(dim=-1)
+            probs_for_st = action_probs
+        action_hard = F.one_hot(action_ids, num_classes=self.budget_num_actions).to(dtype=action_probs.dtype)
+        # 关键调用点：执行离散 budget，反传保留 policy softmax 梯度。
+        action_code = action_hard - probs_for_st.detach() + probs_for_st if self.training else action_hard
+        action_values = self._resolve_budget_action_values(
+            device=budget_logits.device,
+            dtype=action_code.dtype,
+        )
+        budget_values = (action_code * action_values.unsqueeze(0)).sum(dim=-1)
+        return {
+            "budget_values": budget_values,
+            "action_hard": action_hard,
+            "action_ids": action_ids,
+        }
+
     def process_hidden_states_before_layer(self, hidden_states, layer_idx):
         if layer_idx != self.budget_split_layer:
             return hidden_states
@@ -901,18 +1019,60 @@ class OrionBudgetAssigner(nn.Module):
             return hidden_states
 
         budget_hidden = self._gather_query_hidden(hidden_states, self.budget_query_positions)
-        if self.training and self.stage1_enabled:
+        budget_hidden_for_update = budget_hidden
+        if self.forced_budget_value is not None:
+            budget_logits = None
+            budget_action_hard = None
+            budget_action_ids = None
+            budget_values = torch.full(
+                (hidden_states.shape[0],),
+                float(self.forced_budget_value),
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
+        elif self.training and self.stage1_enabled:
+            budget_logits = None
+            budget_action_hard = None
+            budget_action_ids = None
             curriculum_min = self._compute_stage1_curriculum_min()
             budget_values = curriculum_min + (1.0 - curriculum_min) * torch.rand(
                 (hidden_states.shape[0],),
                 device=hidden_states.device,
                 dtype=torch.float32,
             )
+        elif self.stage2_enabled:
+            budget_scheduler_inputs = self._build_budget_scheduler_inputs(hidden_states, budget_hidden)
+            budget_logits = self.budget_scheduler(
+                budget_scheduler_inputs.to(dtype=self.budget_scheduler[0].weight.dtype)
+            )
+            if self.forced_budget_action_ids is not None:
+                forced_ids = self.forced_budget_action_ids.to(device=hidden_states.device, dtype=torch.long)
+                if forced_ids.ndim != 1 or int(forced_ids.size(0)) != int(hidden_states.size(0)):
+                    raise ValueError(
+                        "forced budget action ids must have shape [B], "
+                        f"got {tuple(forced_ids.shape)} for batch={int(hidden_states.size(0))}"
+                    )
+                budget_action_hard = F.one_hot(forced_ids, num_classes=self.budget_num_actions).to(
+                    dtype=budget_logits.dtype
+                )
+                action_values = self._resolve_budget_action_values(
+                    device=budget_logits.device,
+                    dtype=budget_logits.dtype,
+                )
+                budget_values = (budget_action_hard * action_values.unsqueeze(0)).sum(dim=-1)
+                budget_action_ids = forced_ids
+            else:
+                decoded = self._decode_stage2_budget_actions(budget_logits)
+                budget_values = decoded["budget_values"]
+                budget_action_hard = decoded["action_hard"]
+                budget_action_ids = decoded["action_ids"]
         else:
             # 关键调用点：预算调度器保持训练参数原始 dtype，
             # 前向时只把输入对齐到权重 dtype，避免 bf16 hidden 直接喂给 fp32 Linear。
-            budget_hidden = budget_hidden.to(dtype=self.budget_scheduler[0].weight.dtype)
-            budget_logits = self.budget_scheduler(budget_hidden)
+            budget_scheduler_inputs = self._build_budget_scheduler_inputs(hidden_states, budget_hidden)
+            budget_logits = self.budget_scheduler(
+                budget_scheduler_inputs.to(dtype=self.budget_scheduler[0].weight.dtype)
+            )
             budget_probs = F.softmax(budget_logits, dim=-1)
             selected_budget_indices = budget_logits.argmax(dim=-1)
             hard_budget = F.one_hot(selected_budget_indices, num_classes=self.budget_num_actions).to(
@@ -923,15 +1083,25 @@ class OrionBudgetAssigner(nn.Module):
             else:
                 budget_code = hard_budget
             budget_values = (budget_code * self._resolve_budget_action_values(hidden_states.device, budget_code.dtype).unsqueeze(0)).sum(dim=-1)
+            budget_action_hard = hard_budget
+            budget_action_ids = selected_budget_indices
 
-        encoded_budget = self.encode_budget_token(budget_values).to(dtype=hidden_states.dtype)
+        if self.stage2_enabled:
+            # Stage2 的 driving 前向使用离散 budget，policy logits 只由 GRPO 目标更新。
+            budget_values_for_driving = budget_values.detach()
+        else:
+            budget_values_for_driving = budget_values
+        encoded_budget = self.encode_budget_token(budget_values_for_driving).to(dtype=hidden_states.dtype)
         updated_hidden_states = hidden_states.clone()
         budget_positions = self.budget_query_positions.to(hidden_states.device)
         batch_indices = torch.arange(hidden_states.shape[0], device=hidden_states.device)
-        updated_hidden_states[batch_indices, budget_positions] = budget_hidden + encoded_budget
+        updated_hidden_states[batch_indices, budget_positions] = budget_hidden_for_update + encoded_budget
 
-        self.selected_budget_values = budget_values.to(device=hidden_states.device, dtype=torch.float32)
+        self.selected_budget_values = budget_values_for_driving.to(device=hidden_states.device, dtype=torch.float32)
         self.runtime_budget_features = encoded_budget
+        self.budget_action_logits = budget_logits
+        self.budget_action_hard = budget_action_hard
+        self.budget_action_ids = budget_action_ids
         return updated_hidden_states
 
     def _resolve_budget_action_values(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -953,6 +1123,21 @@ class OrionBudgetAssigner(nn.Module):
             raise ValueError("encoded budget feature must be prepared before building execution plan")
         if self.sceneaware_token_positions is None:
             raise ValueError("scene-aware token positions must be prepared before building execution plan")
+
+        if self.forced_budget_value is not None:
+            # 满预算 reference 不经过 path scheduler，直接激活全部 suffix layer。
+            path_logits = hidden_states.new_zeros(
+                (hidden_states.shape[0], self.num_suffix_layers),
+                dtype=self.path_scheduler[-1].weight.dtype,
+            )
+            execution_plan = torch.ones_like(path_logits, dtype=path_logits.dtype)
+            execution_plan_hard = torch.ones_like(path_logits, dtype=torch.bool)
+            self.path_logits = path_logits
+            self.execution_plan = execution_plan
+            self.execution_plan_hard = execution_plan_hard
+            self.path_mask_st = execution_plan
+            self.path_mask_hard = execution_plan_hard
+            return
 
         batch_indices = torch.arange(hidden_states.shape[0], device=hidden_states.device)
         sceneaware_positions = self.sceneaware_token_positions.to(hidden_states.device)
@@ -1026,4 +1211,25 @@ class OrionBudgetAssigner(nn.Module):
             "num_prefix_layers": self.num_prefix_layers,
             "num_hidden_layers": self.num_hidden_layers,
             "budget_min": self.budget_min,
+        }
+
+    def get_stage2_grpo_training_signals(self) -> Dict[str, Any]:
+        """导出 stage2 GRPO 所需的 budget policy runtime 信号。"""
+        if self.selected_budget_values is None:
+            raise ValueError("stage2 GRPO requires selected_budget_values")
+        if self.budget_action_logits is None:
+            raise ValueError("stage2 GRPO requires budget_action_logits")
+        return {
+            "budget_values": self.selected_budget_values,
+            "budget_action_logits": self.budget_action_logits,
+            "budget_action_hard": self.budget_action_hard,
+            "budget_action_ids": self.budget_action_ids,
+            "budget_query_feat_std": self.budget_query_feat_std,
+            "budget_min": torch.tensor(
+                float(self.budget_min),
+                device=self.selected_budget_values.device,
+                dtype=torch.float32,
+            ),
+            "num_prefix_layers": self.num_prefix_layers,
+            "num_hidden_layers": self.num_hidden_layers,
         }

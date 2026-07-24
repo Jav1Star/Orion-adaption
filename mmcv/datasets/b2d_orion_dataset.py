@@ -42,7 +42,7 @@ import math
 
 @DATASETS.register_module()
 class B2DOrionDataset(Custom3DDataset):
-    def __init__(self, queue_length=4, seq_mode=False, seq_split_num=1, overlap_test=False,with_velocity=True,sample_interval=5,name_mapping= None,eval_cfg = None, map_root =None,map_file=None,past_frames=2, future_frames=6,point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0] ,polyline_points_num=20,*args, eval_mode=['lane', 'det'], **kwargs):
+    def __init__(self, queue_length=4, seq_mode=False, seq_split_num=1, overlap_test=False,with_velocity=True,sample_interval=5,name_mapping= None,eval_cfg = None, map_root =None,map_file=None,past_frames=2, future_frames=6,point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0] ,polyline_points_num=20,*args, eval_mode=['lane', 'det'], full_budget_losses_jsonl=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.queue_length = queue_length
         self.overlap_test = overlap_test
@@ -63,6 +63,8 @@ class B2DOrionDataset(Custom3DDataset):
         self.map_ann_file = 'data/infos'
         self.eval_cfg  = eval_cfg
         self.eval_mode = eval_mode
+        self.full_budget_losses_jsonl = full_budget_losses_jsonl
+        self.full_budget_loss_index = self._load_full_budget_loss_index(full_budget_losses_jsonl)
         with open(self.map_file,'rb') as f: 
             self.map_infos = pickle.load(f)
         if seq_mode:
@@ -113,6 +115,43 @@ class B2DOrionDataset(Custom3DDataset):
                 assert len(np.bincount(new_flags)) == len(np.bincount(self.flag)) * self.seq_split_num
                 self.flag = np.array(new_flags, dtype=np.int64)
 
+    def _load_full_budget_loss_index(self, jsonl_path):
+        if jsonl_path is None or str(jsonl_path).strip() == "":
+            return {}
+        jsonl_path = osp.expanduser(str(jsonl_path))
+        if not osp.isfile(jsonl_path):
+            raise ValueError(f"full_budget_losses_jsonl not found: {jsonl_path}")
+        loss_index = {}
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line_no, raw_line in enumerate(f, start=1):
+                line = raw_line.strip()
+                if line == "":
+                    continue
+                row = json.loads(line)
+                measurement_path = row.get("measurement_path", None)
+                if measurement_path is None or str(measurement_path).strip() == "":
+                    raise ValueError(f"{jsonl_path}:{line_no} missing measurement_path")
+                if "loss_driving_full" not in row:
+                    raise ValueError(f"{jsonl_path}:{line_no} missing loss_driving_full")
+                key = osp.normpath(str(measurement_path))
+                if key in loss_index:
+                    raise ValueError(f"duplicated full-budget measurement_path: {key}")
+                loss_index[key] = float(row["loss_driving_full"])
+        if len(loss_index) == 0:
+            raise ValueError(f"empty full_budget_losses_jsonl: {jsonl_path}")
+        return loss_index
+
+    def _lookup_full_budget_driving_loss(self, measurement_path):
+        if len(self.full_budget_loss_index) == 0:
+            return None
+        key = osp.normpath(str(measurement_path))
+        if key not in self.full_budget_loss_index:
+            raise ValueError(
+                "Missing full-budget driving loss for measurement_path="
+                f"{key}, jsonl={self.full_budget_losses_jsonl}"
+            )
+        return self.full_budget_loss_index[key]
+
     def invert_pose(self, pose):
         inv_pose = np.eye(4)
         inv_pose[:3, :3] = np.transpose(pose[:3, :3])
@@ -162,9 +201,20 @@ class B2DOrionDataset(Custom3DDataset):
         metas_map = {}
         for i, each in enumerate(queue):
             metas_map[i] = each['img_metas'].data
+        current_img_meta = queue[-1]['img_metas'].data
 
         queue[-1]['img'] = DC(torch.stack(imgs_list), cpu_only=False, stack=True)
         queue[-1]['img_metas'] = DC(metas_map, cpu_only=True)
+        full_budget_driving_loss = self._lookup_full_budget_driving_loss(
+            current_img_meta['measurement_path']
+        )
+        if full_budget_driving_loss is not None:
+            # 关键调用点：stage2 GRPO 只消费 reference 标量，不把采集流程耦合进训练。
+            queue[-1]['full_budget_driving_loss'] = DC(
+                torch.tensor(full_budget_driving_loss, dtype=torch.float32),
+                cpu_only=False,
+                stack=True,
+            )
         queue = queue[-1]
         return queue
 
@@ -188,6 +238,13 @@ class B2DOrionDataset(Custom3DDataset):
                 - ann_info (dict): Annotation info.
         """
         info = self.data_infos[index]
+        measurement_path = osp.join(
+            self.data_root,
+            info['folder'],
+            'anno',
+            f"{int(info['frame_idx']):05d}.json.gz",
+        )
+        route_key = osp.join(self.data_root, info['folder'])
 
         for i in range(len(info['gt_names'])):
             if info['gt_names'][i] in self.NameMapping.keys():
@@ -202,6 +259,8 @@ class B2DOrionDataset(Custom3DDataset):
             folder=info['folder'],
             scene_token=info['folder'],
             frame_idx=info['frame_idx'],
+            measurement_path=measurement_path,
+            route_key=route_key,
             ego_yaw=np.nan_to_num(info['ego_yaw'],nan=np.pi/2),
             ego_translation=info['ego_translation'],
             sensors=info['sensors'],

@@ -127,6 +127,63 @@ class GradientCumulativeOptimizerHook(OptimizerHook):
             runner.optimizer.zero_grad()
 
 
+@HOOKS.register_module()
+class OrionStage2GRPOOptimizerHook(OptimizerHook):
+    """Orion stage2 GRPO 同一 rollout 多次更新的 optimizer hook。"""
+
+    def __init__(self, grad_clip=None):
+        super(OrionStage2GRPOOptimizerHook, self).__init__(grad_clip=grad_clip)
+
+    @staticmethod
+    def _unwrap_model(model):
+        return model.module if hasattr(model, "module") else model
+
+    def _prepare_forward(self, runner, update_idx, update_epochs):
+        model = self._unwrap_model(runner.model)
+        if hasattr(model, "prepare_stage2_grpo_iteration"):
+            model.prepare_stage2_grpo_iteration(
+                global_step=int(runner.iter),
+                update_idx=int(update_idx),
+                update_history=int(update_idx) == int(update_epochs) - 1,
+                total_iters=int(runner.max_iters),
+            )
+
+    def _finish_iteration(self, runner):
+        model = self._unwrap_model(runner.model)
+        if hasattr(model, "finish_stage2_grpo_iteration"):
+            model.finish_stage2_grpo_iteration()
+
+    def _backward_step(self, runner):
+        runner.optimizer.zero_grad()
+        runner.outputs['loss'].backward()
+        if self.grad_clip is not None:
+            grad_norm = self.clip_grads(runner.model.parameters())
+            if grad_norm is not None:
+                runner.log_buffer.update({'grad_norm': float(grad_norm)}, runner.outputs['num_samples'])
+        runner.optimizer.step()
+
+    def before_train_iter(self, runner):
+        model = self._unwrap_model(runner.model)
+        if not hasattr(model, "get_stage2_grpo_update_epochs"):
+            return
+        update_epochs = int(model.get_stage2_grpo_update_epochs())
+        self._prepare_forward(runner, update_idx=0, update_epochs=update_epochs)
+
+    def after_train_iter(self, runner):
+        model = self._unwrap_model(runner.model)
+        update_epochs = int(model.get_stage2_grpo_update_epochs()) if hasattr(model, "get_stage2_grpo_update_epochs") else 1
+        try:
+            self._backward_step(runner)
+            for update_idx in range(1, update_epochs):
+                self._prepare_forward(runner, update_idx=update_idx, update_epochs=update_epochs)
+                runner.outputs = runner.model(runner.data_batch, return_loss=True)
+                if 'log_vars' in runner.outputs:
+                    runner.log_buffer.update(runner.outputs['log_vars'], runner.outputs['num_samples'])
+                self._backward_step(runner)
+        finally:
+            self._finish_iteration(runner)
+
+
 if (digit_version(TORCH_VERSION) >= digit_version('1.6.0')):
 
     @HOOKS.register_module()

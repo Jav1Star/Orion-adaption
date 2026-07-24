@@ -517,6 +517,7 @@ class CustomCollect3D(object):
                             'pcd_scale_factor', 'pcd_rotation', 'pts_filename',
                             'transformation_3d_flow', 'scene_token',
                             'can_bus','folder','frame_idx','vlm_labels', 'lidar2ego',
+                            'measurement_path', 'route_key',
                             'traffic_state_mask', 'traffic_state',
                             )):
         # TODO(yzj) bevformer meta_keys has lidar2cam
@@ -543,6 +544,9 @@ class CustomCollect3D(object):
         data['img_metas'] = DC(img_metas, cpu_only=True)
         for key in self.keys:
             data[key] = results[key]
+        for key in ['measurement_path', 'route_key']:
+            if key in results:
+                data[key] = DC(results[key], cpu_only=True)
         return data
 
     def __repr__(self):

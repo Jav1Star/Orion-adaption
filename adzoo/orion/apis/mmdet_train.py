@@ -14,6 +14,7 @@ from torch.nn.parallel.distributed import DistributedDataParallel
 from mmcv.runner import (HOOKS, DistSamplerSeedHook, EpochBasedRunner,
                          Fp16OptimizerHook, GradientCumulativeOptimizerHook,
                          OptimizerHook,
+                         OrionStage2GRPOOptimizerHook,
                          build_runner, )
 from mmcv.optims import build_optimizer
 from mmcv.utils import build_from_cfg, wrap_bf16_model
@@ -146,10 +147,12 @@ def custom_train_detector(model,
         elif optimizer_hook_type == 'GradientCumulativeOptimizerHook':
             # 关键调用点：bf16 训练与累积梯度并不冲突，这里直接复用 mmcv 的累积梯度 hook。
             optimizer_config = GradientCumulativeOptimizerHook(**optimizer_hook_cfg)
+        elif optimizer_hook_type == 'OrionStage2GRPOOptimizerHook':
+            optimizer_config = OrionStage2GRPOOptimizerHook(**optimizer_hook_cfg)
         else:
             raise ValueError(
                 'bf16 training only supports OptimizerHook or '
-                'GradientCumulativeOptimizerHook, '
+                'GradientCumulativeOptimizerHook or OrionStage2GRPOOptimizerHook, '
                 f'got {optimizer_hook_type}')
     elif distributed and 'type' not in cfg.optimizer_config:
         optimizer_config = OptimizerHook(**cfg.optimizer_config)

@@ -124,6 +124,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
         return_ego_feature: Optional[bool] = False,
+        return_loss_per_sample: Optional[bool] = False,
         adalava_controller=None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
@@ -192,10 +193,20 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         logits = logits.float()
 
         loss = None
+        loss_per_sample = None
         if labels is not None:
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
+            if return_loss_per_sample:
+                token_losses = F.cross_entropy(
+                    shift_logits.transpose(1, 2),
+                    shift_labels.to(shift_logits.device),
+                    ignore_index=-100,
+                    reduction='none',
+                )
+                valid_mask = shift_labels.ne(-100).to(device=shift_logits.device)
+                loss_per_sample = token_losses.sum(dim=-1) / valid_mask.sum(dim=-1).clamp_min(1)
             # Flatten the tokens
             loss_fct = CrossEntropyLoss(weight=self.weighted_mask.float())
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
@@ -212,21 +223,27 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         # self.model.embed_tokens = self.model.embed_tokens.to(torch.float32)
         # self.model.to(torch.float32)
         if return_ego_feature:
-            return CausalLMOutputWithPast(
-                loss=loss,
-                logits=logits,
-                past_key_values=outputs.past_key_values,
-                hidden_states=outputs.hidden_states,
-                attentions=outputs.attentions,
-            ), selected_hidden_states
-        else:
-            return CausalLMOutputWithPast(
+            output = CausalLMOutputWithPast(
                 loss=loss,
                 logits=logits,
                 past_key_values=outputs.past_key_values,
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,
             )
+            if return_loss_per_sample:
+                return output, selected_hidden_states, loss_per_sample
+            return output, selected_hidden_states
+        else:
+            output = CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+            if return_loss_per_sample:
+                return output, loss_per_sample
+            return output
        
 
     @torch.no_grad()

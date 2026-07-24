@@ -214,6 +214,14 @@ class Orion(MVXTwoStageDetector):
         self.adaption_budget_curriculum_warmup_steps = self.adaption_cfg.get('budget_curriculum_warmup_steps', 0)
         self.adaption_sample_interval = int(self.adaption_cfg.get('sample_interval', 5))
         self.adaption_stage1_enabled = self.adaption_train_stage == 'stage1'
+        self.adaption_stage2_enabled = self.adaption_train_stage == 'stage2'
+        self.adaption_stage2_grpo_cfg = self.adaption_cfg.get('stage2_grpo', {})
+        self._stage2_grpo_rollout_cache = None
+        self._stage2_grpo_update_idx = 0
+        self._stage2_grpo_global_step = 0
+        self._stage2_grpo_update_history = False
+        self._stage2_grpo_collecting_rollout = False
+        self._stage2_grpo_total_train_iters = None
         self.adaption_stage1_aux_enabled = bool(self.adaption_cfg.get('stage1_aux_enabled', False))
         self.adaption_stage1_aux_div_enabled = bool(self.adaption_cfg.get('stage1_aux_div_enabled', False))
         self.adaption_stage1_aux_div_margin = float(self.adaption_cfg.get('stage1_aux_div_margin', 0.05))
@@ -285,6 +293,15 @@ class Orion(MVXTwoStageDetector):
                         self.pts_bbox_head.num_memory if self.pts_bbox_head.use_memory else 0
                     ),
                 )
+                if self.adaption_stage2_enabled:
+                    self.adaption_assigner.configure_stage2_budget_exploration(
+                        enabled=bool(self.adaption_stage2_grpo_cfg.get('grpo_budget_explore_enable', True)),
+                        temp_start=float(self.adaption_stage2_grpo_cfg.get('grpo_budget_explore_temp_start', 1.5)),
+                        temp_end=float(self.adaption_stage2_grpo_cfg.get('grpo_budget_explore_temp_end', 1.0)),
+                        eps_start=float(self.adaption_stage2_grpo_cfg.get('grpo_budget_explore_eps_start', 0.20)),
+                        eps_end=float(self.adaption_stage2_grpo_cfg.get('grpo_budget_explore_eps_end', 0.03)),
+                        anneal_ratio=float(self.adaption_stage2_grpo_cfg.get('grpo_budget_explore_anneal_ratio', 0.15)),
+                    )
                 if (
                     self.adaption_stage1_enabled
                     and self.adaption_stage1_aux_enabled
@@ -417,6 +434,9 @@ class Orion(MVXTwoStageDetector):
         if self.adaption_stage1_enabled:
             # 关键调用点：stage1 训练参数白名单由 Orion 统一收敛，避免分散到各 head / dataset。
             self._configure_adaption_stage1_trainable_parameters()
+        if self.adaption_stage2_enabled:
+            # 关键调用点：stage2 默认只训练预算策略，复用 stage1 已学到的 path 组合能力。
+            self._configure_adaption_stage2_trainable_parameters()
         if self.bf16_train:
             # 关键调用点：bf16 训练只压缩整棵冻结子树，避免在同一模块内混放 trainable fp32 与 frozen bf16。
             self._convert_frozen_modules_to_bf16()
@@ -467,6 +487,77 @@ class Orion(MVXTwoStageDetector):
             if layer_idx < int(self.adaption_num_prefix_layers):
                 param.requires_grad = True
 
+    def _configure_adaption_stage2_trainable_parameters(self):
+        if not self.adaption_enabled or not self.with_lm_head:
+            return
+
+        for param in self.parameters():
+            param.requires_grad = False
+
+        for param in self.adaption_assigner.budget_query_embed.parameters() if isinstance(self.adaption_assigner.budget_query_embed, nn.Module) else [self.adaption_assigner.budget_query_embed]:
+            param.requires_grad = True
+        for param in self.adaption_assigner.budget_scheduler.parameters():
+            param.requires_grad = True
+
+        if bool(self.adaption_stage2_grpo_cfg.get('unfreeze_scene_aware', False)):
+            sceneaware_modules = [
+                self.adaption_assigner.visual_encoder,
+                self.adaption_assigner.det_class_embed,
+                self.adaption_assigner.map_class_embed,
+                self.adaption_assigner.det_encoder,
+                self.adaption_assigner.map_encoder,
+                self.adaption_assigner.traj_encoder,
+            ]
+            for module in sceneaware_modules:
+                for param in module.parameters():
+                    param.requires_grad = True
+
+        if bool(self.adaption_stage2_grpo_cfg.get('grpo_unfreeze_prefix', False)):
+            prefix_train_layers = max(int(self.adaption_num_prefix_layers) // 2, 1)
+            for name, param in self.lm_head.named_parameters():
+                if 'lora_' not in name:
+                    continue
+                match = re.search(r'\.layers\.(\d+)\.', name)
+                if match is None:
+                    continue
+                if int(match.group(1)) < prefix_train_layers:
+                    param.requires_grad = True
+
+    def is_adaption_stage2_grpo_enabled(self):
+        return bool(self.adaption_enabled and self.adaption_stage2_enabled)
+
+    def get_stage2_grpo_update_epochs(self):
+        if not self.is_adaption_stage2_grpo_enabled():
+            return 1
+        return int(self.adaption_stage2_grpo_cfg.get('grpo_update_epochs', 1))
+
+    def prepare_stage2_grpo_iteration(self, global_step, update_idx, update_history, total_iters=None):
+        if not self.is_adaption_stage2_grpo_enabled():
+            return
+        if int(update_idx) == 0:
+            self._stage2_grpo_rollout_cache = None
+        self._stage2_grpo_update_idx = int(update_idx)
+        self._stage2_grpo_update_history = bool(update_history)
+        self._stage2_grpo_global_step = int(global_step)
+        if total_iters is not None:
+            self._stage2_grpo_total_train_iters = int(total_iters)
+        update_epochs = max(self.get_stage2_grpo_update_epochs(), 1)
+        total_steps = None
+        if self._stage2_grpo_total_train_iters is not None:
+            total_steps = int(self._stage2_grpo_total_train_iters) * update_epochs
+        self.adaption_assigner.set_stage2_budget_exploration_progress(
+            global_step=int(global_step) * update_epochs + int(update_idx),
+            total_steps=total_steps,
+        )
+
+    def finish_stage2_grpo_iteration(self):
+        if not self.is_adaption_stage2_grpo_enabled():
+            return
+        # 关键调用点：同一 batch 的 rollout cache 只在 update_epochs 内复用。
+        self._stage2_grpo_rollout_cache = None
+        self._stage2_grpo_update_idx = 0
+        self._stage2_grpo_update_history = False
+
     def _convert_frozen_modules_to_bf16(self):
         # 关键调用点：当前仓库里最值得先压缩的是冻结 LLM，本轮先收敛到这一条稳定路径，避免把更多旧模块一起拖进 bf16 边界问题。
         bf16_module_names = ['lm_head']
@@ -513,7 +604,7 @@ class Orion(MVXTwoStageDetector):
         return tensor.to(dtype=target_dtype)
 
     def _extract_route_keys(self, img_metas):
-        return [img_meta.get('scene_token', img_meta.get('folder')) for img_meta in img_metas]
+        return [img_meta.get('route_key', img_meta.get('scene_token', img_meta.get('folder'))) for img_meta in img_metas]
 
     def _extract_frame_indices(self, img_metas):
         return [int(img_meta['frame_idx']) for img_meta in img_metas]
@@ -532,6 +623,7 @@ class Orion(MVXTwoStageDetector):
         if self.adaption_assigner is None:
             return
         self.adaption_assigner.set_stage1_budget_total_iters(total_iters)
+        self._stage2_grpo_total_train_iters = int(total_iters)
 
     def _decode_sceneaware_bbox_results(self, outs_bbox, img_metas):
         bbox_results = []
@@ -569,6 +661,515 @@ class Orion(MVXTwoStageDetector):
             chosen_trajs = ego_fut_preds[cmd_mask].cumsum(dim=-2)
             return [traj.detach().to(dtype=torch.float32) for traj in chosen_trajs]
         return None
+
+    def _ensure_full_budget_collection_path(self):
+        if not self.use_gen_token or self.use_diff_decoder or self.use_mlp_decoder:
+            raise ValueError(
+                "full-budget collection only supports use_gen_token=True, "
+                "use_diff_decoder=False, use_mlp_decoder=False"
+            )
+        if not self.with_bound_loss:
+            raise ValueError("full-budget collection requires with_bound_loss=True for loss_plan_bound")
+        if self.mix_qa_training:
+            raise ValueError("full-budget collection does not support mix_qa_training")
+        if self.adaption_assigner is None:
+            raise ValueError("full-budget collection requires adaption_assigner")
+
+    def _loss_plan_reg_per_sample(self, ego_fut_preds, ego_fut_gt, ego_fut_masks, ego_fut_cmd):
+        ego_fut_gt = ego_fut_gt.unsqueeze(1).repeat(1, self.ego_fut_mode, 1, 1)
+        loss_plan_l1_weight = ego_fut_cmd[..., None, None] * ego_fut_masks[:, None, :, None]
+        loss_plan_l1_weight = loss_plan_l1_weight.repeat(1, 1, 1, 2)
+        loss = self.loss_plan_reg(
+            ego_fut_preds,
+            ego_fut_gt,
+            loss_plan_l1_weight,
+            reduction_override='none',
+        )
+        return torch.nan_to_num(loss.flatten(1).mean(dim=1))
+
+    def _loss_plan_bound_per_sample(self, ego_fut_preds, ego_fut_masks, ego_fut_cmd, lane_preds, lane_scores):
+        chosen_preds = ego_fut_preds[ego_fut_cmd == 1]
+        if chosen_preds.shape[0] != ego_fut_preds.shape[0]:
+            raise ValueError("ego_fut_cmd must select exactly one planning mode per sample")
+        loss = self.loss_plan_bound(
+            chosen_preds,
+            lane_preds,
+            lane_scores,
+            weight=ego_fut_masks,
+            denormalize=False,
+            reduction_override='none',
+        )
+        return torch.nan_to_num(loss.flatten(1).mean(dim=1))
+
+    def _loss_plan_col_per_sample(
+        self,
+        ego_fut_preds,
+        ego_fut_masks,
+        ego_fut_cmd,
+        agent_preds,
+        agent_fut_preds,
+        agent_score_preds,
+        agent_fut_cls_preds,
+    ):
+        chosen_preds = ego_fut_preds[ego_fut_cmd == 1]
+        if chosen_preds.shape[0] != ego_fut_preds.shape[0]:
+            raise ValueError("ego_fut_cmd must select exactly one planning mode per sample")
+        loss = self.loss_plan_col(
+            chosen_preds,
+            agent_preds,
+            agent_fut_preds,
+            agent_score_preds,
+            agent_fut_cls_preds,
+            weight=ego_fut_masks[:, :, None].repeat(1, 1, 2),
+            reduction_override='none',
+        )
+        return torch.nan_to_num(loss.flatten(1).mean(dim=1))
+
+    def _loss_vae_gen_per_sample(self, distribution_comp, valid_mask):
+        present_mu = distribution_comp['present_mu']
+        present_log_sigma = distribution_comp['present_log_sigma']
+        future_mu = distribution_comp['future_mu']
+        future_log_sigma = distribution_comp['future_log_sigma']
+        var_future = torch.exp(2 * future_log_sigma)
+        var_present = torch.exp(2 * present_log_sigma)
+        kl_div = (
+            present_log_sigma
+            - future_log_sigma
+            - 0.5
+            + (var_future + (future_mu - present_mu) ** 2) / (2 * var_present)
+        )
+        kl_div = kl_div * valid_mask.any(dim=-1).unsqueeze(-1).unsqueeze(-1)
+        loss = torch.sum(kl_div, dim=-1).flatten(1).mean(dim=1) * self.loss_vae_gen.loss_weight
+        return torch.nan_to_num(loss)
+
+    def collect_full_budget_losses(self,
+                                   img_metas=None,
+                                   gt_bboxes_3d=None,
+                                   gt_labels_3d=None,
+                                   gt_attr_labels=None,
+                                   map_gt_bboxes_3d=None,
+                                   map_gt_labels_3d=None,
+                                   input_ids=None,
+                                   vlm_labels=None,
+                                   ego_fut_trajs=None,
+                                   forced_budget_value=1.0,
+                                   **data):
+        """离线采集 full-budget reference，只返回逐样本 driving 主损失。"""
+        self._ensure_full_budget_collection_path()
+        if self.tokenizer is None:
+            raise ValueError("full-budget collection requires tokenizer")
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids,
+            batch_first=True,
+            padding_value=self.tokenizer.pad_token_id,
+        )
+        vlm_labels = torch.nn.utils.rnn.pad_sequence(
+            vlm_labels,
+            batch_first=True,
+            padding_value=IGNORE_INDEX,
+        )
+        input_ids = input_ids[:, :self.tokenizer.model_max_length]
+        vlm_labels = vlm_labels[:, :self.tokenizer.model_max_length]
+        vlm_attn_mask = input_ids.ne(self.tokenizer.pad_token_id)
+        img_metas = self._select_current_frame_img_metas(img_metas)
+
+        previous_forced_budget_value = self.adaption_assigner.forced_budget_value
+        self.adaption_assigner.set_forced_budget_value(forced_budget_value)
+        try:
+            data['img_feats'] = self.extract_feat(data['img'])
+            return self._forward_pts_collect_full_budget_losses(
+                gt_bboxes_3d=gt_bboxes_3d,
+                gt_labels_3d=gt_labels_3d,
+                gt_attr_labels=gt_attr_labels,
+                map_gt_bboxes_3d=map_gt_bboxes_3d,
+                map_gt_labels_3d=map_gt_labels_3d,
+                img_metas=img_metas,
+                input_ids=input_ids,
+                vlm_labels=vlm_labels,
+                vlm_attn_mask=vlm_attn_mask,
+                ego_fut_trajs=ego_fut_trajs,
+                **data,
+            )
+        finally:
+            self.adaption_assigner.set_forced_budget_value(previous_forced_budget_value)
+
+    def _forward_pts_collect_full_budget_losses(
+        self,
+        gt_bboxes_3d,
+        gt_labels_3d,
+        gt_attr_labels,
+        map_gt_bboxes_3d,
+        map_gt_labels_3d,
+        img_metas,
+        input_ids,
+        vlm_labels,
+        vlm_attn_mask,
+        ego_fut_trajs,
+        **data,
+    ):
+        B = data['img'].shape[0]
+        location = self.prepare_location(img_metas, **data)
+        pos_embed = self.position_embeding(data, location, img_metas)
+
+        outs_bbox, det_query, current_scene_queries = self.pts_bbox_head(img_metas, pos_embed, **data)
+        vision_embeded_obj = det_query.clone()
+        agent_outs = None
+        if self.use_col_loss:
+            loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs_bbox, gt_attr_labels]
+            if self.pts_bbox_head.pred_traffic_light_state:
+                loss_inputs.extend([data['traffic_state'], data['traffic_state_mask']])
+            _, agent_outs = self.pts_bbox_head.loss(*loss_inputs)
+
+        outs_lane, map_query = self.map_head(img_metas, pos_embed, **data)
+        vision_embeded_map = map_query.clone()
+        vision_embeded = torch.cat([vision_embeded_obj, vision_embeded_map], dim=1)
+
+        current_bbox_results = self._decode_sceneaware_bbox_results(outs_bbox, img_metas)
+        current_lane_results = self._decode_sceneaware_lane_results(outs_lane, img_metas)
+        current_visual_queries, current_bbox_results, current_lane_results = self._build_current_sceneaware_inputs(
+            current_scene_queries=current_scene_queries,
+            current_bbox_results=current_bbox_results,
+            current_lane_results=current_lane_results,
+        )
+        self.adaption_assigner.build_sceneaware_inputs_before_llm(
+            current_visual_queries=current_visual_queries,
+            current_det_results=current_bbox_results,
+            current_map_results=current_lane_results,
+            route_keys=self._extract_route_keys(img_metas),
+            frame_idxs=self._extract_frame_indices(img_metas),
+            sample_idxs=list(range(B)),
+        )
+
+        vlm_outputs, ego_feature, vlm_loss_per_sample = self.lm_head(
+            input_ids=input_ids,
+            attention_mask=vlm_attn_mask,
+            labels=vlm_labels,
+            images=vision_embeded,
+            use_cache=False,
+            return_ego_feature=True,
+            return_loss_per_sample=True,
+            adalava_controller=self.adaption_assigner,
+        )
+        current_states = ego_feature.unsqueeze(1)
+        future_distribution_inputs = ego_fut_trajs.reshape(B, ego_fut_trajs.shape[1], -1)
+        noise = torch.zeros(
+            (B, 1, self.latent_dim),
+            device=ego_feature.device,
+            dtype=ego_feature.dtype,
+        )
+        sample, output_distribution = self.distribution_forward(
+            current_states,
+            future_distribution_inputs,
+            noise,
+        )
+
+        hidden_states = ego_feature.unsqueeze(1)
+        states_hs, _ = self.future_states_predict(B, sample, hidden_states, current_states)
+        ego_query_hs = states_hs[:, :, 0, :].unsqueeze(1).permute(0, 2, 1, 3)
+        ego_fut_trajs_list = []
+        for i in range(self.fut_ts):
+            ego_query_input = self._align_tensor_to_module_dtype(ego_query_hs[i], self.ego_fut_decoder)
+            outputs_ego_trajs = self.ego_fut_decoder(ego_query_input).reshape(B, self.ego_fut_mode, 2)
+            ego_fut_trajs_list.append(outputs_ego_trajs)
+        ego_fut_preds = torch.stack(ego_fut_trajs_list, dim=2)
+
+        lane_scores = outs_lane['all_lane_cls_one2one'][-1]
+        lane_preds = outs_lane['all_lane_preds_one2one'][-1]
+        for p in range(self.map_head.n_control):
+            lane_preds[..., 3 * p].clamp_(min=self.map_head.pc_range[0], max=self.map_head.pc_range[3])
+            lane_preds[..., 3 * p + 1].clamp_(min=self.map_head.pc_range[1], max=self.map_head.pc_range[4])
+        lane_preds = lane_preds.reshape(lane_preds.shape[0], lane_preds.shape[1], -1, 3)[..., :2]
+
+        ego_masks = data['ego_fut_masks'][:, 0, 0]
+        ego_cmd = data['ego_fut_cmd'][:, 0, 0]
+        loss_plan_reg = self._loss_plan_reg_per_sample(
+            ego_fut_preds,
+            ego_fut_trajs[:, 0],
+            ego_masks,
+            ego_cmd,
+        )
+        loss_plan_bound = self._loss_plan_bound_per_sample(
+            ego_fut_preds,
+            ego_masks,
+            ego_cmd,
+            lane_preds,
+            lane_scores,
+        )
+        if self.use_col_loss:
+            loss_plan_col = self._loss_plan_col_per_sample(
+                ego_fut_preds,
+                ego_masks,
+                ego_cmd,
+                **agent_outs,
+            )
+        else:
+            # checkpoint 未训练 collision 分支时，reference 的 driving loss 明确不纳入该项。
+            loss_plan_col = torch.zeros_like(loss_plan_reg)
+        loss_vae_gen = self._loss_vae_gen_per_sample(output_distribution, ego_masks)
+        vlm_loss_per_sample = torch.nan_to_num(vlm_loss_per_sample.to(device=loss_plan_reg.device))
+        loss_driving_full = (
+            vlm_loss_per_sample
+            + loss_plan_reg
+            + loss_plan_bound
+            + loss_vae_gen
+        )
+        if self.use_col_loss:
+            loss_driving_full = loss_driving_full + loss_plan_col
+
+        sceneaware_future_trajs = self._select_train_sceneaware_future_trajs(
+            data=data,
+            ego_fut_preds=ego_fut_preds,
+        )
+        self.adaption_assigner.update_sceneaware_history_after_llm(
+            route_keys=self._extract_route_keys(img_metas),
+            frame_idxs=self._extract_frame_indices(img_metas),
+            current_visual_queries=current_visual_queries,
+            current_det_results=current_bbox_results,
+            current_map_results=current_lane_results,
+            current_future_trajs=sceneaware_future_trajs,
+            current_ego_poses=self._stack_meta_tensor(img_metas, 'ego_pose', device=vision_embeded.device, fallback=data.get('ego_pose')),
+            current_timestamps=self._stack_meta_tensor(img_metas, 'timestamp', device=vision_embeded.device, fallback=data.get('timestamp')),
+        )
+        return {
+            'loss_driving_full': torch.nan_to_num(loss_driving_full),
+            'vlm_loss': vlm_loss_per_sample,
+            'loss_plan_reg': loss_plan_reg,
+            'loss_plan_bound': loss_plan_bound,
+            'loss_plan_col': loss_plan_col,
+            'loss_vae_gen': loss_vae_gen,
+        }
+
+    def _compute_stage2_entropy_beta(self, global_step: int) -> float:
+        cfg = self.adaption_stage2_grpo_cfg
+        beta_peak = float(cfg.get('grpo_entropy_beta', 0.01))
+        beta_start = float(cfg.get('grpo_entropy_beta_start', 0.0))
+        warmup_steps = int(cfg.get('grpo_entropy_warmup_steps', 0))
+        global_step_f = max(float(global_step), 0.0)
+        if warmup_steps > 0 and global_step_f < float(warmup_steps):
+            progress = min(max(global_step_f / float(warmup_steps), 0.0), 1.0)
+            return beta_start + progress * (beta_peak - beta_start)
+        decay_steps = int(cfg.get('grpo_entropy_decay_steps', 0))
+        if decay_steps <= 0:
+            return beta_peak
+        beta_final = float(cfg.get('grpo_entropy_beta_final', beta_peak))
+        decay_progress = min(max((global_step_f - float(max(warmup_steps, 0))) / float(decay_steps), 0.0), 1.0)
+        return beta_peak + decay_progress * (beta_final - beta_peak)
+
+    @staticmethod
+    def _compute_stage2_grpo_rewards(stage2_cfg, distill_gap, full_budget_driving_loss, budget_normalized):
+        # 关键调用点：对齐 SimLingo v2 reward，easy sample 保留绝对容忍量。
+        allowed_gap = float(stage2_cfg.get('grpo_gap_abs_eps', 0.02)) + float(stage2_cfg.get('grpo_gap_rel_eps', 0.1)) * (
+            full_budget_driving_loss.unsqueeze(1)
+        )
+        slack = allowed_gap - distill_gap
+        gate = torch.sigmoid(slack / float(stage2_cfg.get('grpo_gate_temp', 0.02)))
+        save_margin = float(stage2_cfg.get('grpo_reward_save_margin', 0.03))
+        save_temp = float(stage2_cfg.get('grpo_reward_save_temp', stage2_cfg.get('grpo_gate_temp', 0.02)))
+        save_gate = torch.sigmoid((slack - save_margin) / save_temp)
+        hit_reward = float(stage2_cfg.get('grpo_reward_hit', 0.4)) * gate
+        save_reward = (
+            float(stage2_cfg.get('grpo_reward_save', 0.10))
+            * save_gate
+            * torch.pow(1.0 - budget_normalized, float(stage2_cfg.get('grpo_reward_save_gamma', 1.0)))
+        )
+        margin_reward = float(stage2_cfg.get('grpo_reward_margin', 0.4)) * torch.tanh(
+            F.relu(slack) / float(stage2_cfg.get('grpo_reward_margin_scale', 0.08))
+        )
+        violate_penalty = float(stage2_cfg.get('grpo_reward_violate', 2.0)) * torch.log1p(
+            F.relu(-slack) / float(stage2_cfg.get('grpo_reward_violate_scale', 0.05))
+        )
+        rewards = hit_reward + save_reward + margin_reward - violate_penalty
+        return {
+            'rewards': rewards,
+            'allowed_gap': allowed_gap,
+            'slack': slack,
+            'gate': gate,
+        }
+
+    def _sample_stage2_grpo_rollout_actions(self, budget_action_logits_old):
+        cfg = self.adaption_stage2_grpo_cfg
+        sampling_mode = str(cfg.get('grpo_rollout_sampling', 'bucket')).strip().lower()
+        if sampling_mode != 'bucket':
+            group_size = int(cfg.get('grpo_group_size', 5))
+            explore_cfg = self.adaption_assigner.resolve_stage2_budget_exploration()
+            temperature = float(explore_cfg['temperature'])
+            epsilon = float(explore_cfg['epsilon'])
+            num_actions = int(budget_action_logits_old.size(1))
+            old_probs_temp = F.softmax(budget_action_logits_old / temperature, dim=-1)
+            behavior_probs = (1.0 - epsilon) * old_probs_temp + epsilon / float(num_actions)
+            sampled_ids = torch.distributions.Categorical(probs=behavior_probs).sample((group_size,)).transpose(0, 1)
+            behavior_logp = torch.log(behavior_probs).gather(dim=1, index=sampled_ids)
+            return sampled_ids.contiguous(), behavior_logp.contiguous()
+
+        num_actions = int(budget_action_logits_old.size(1))
+        if num_actions != 10:
+            raise ValueError(f"bucket rollout expects 10 budget actions, got {num_actions}")
+        explore_cfg = self.adaption_assigner.resolve_stage2_budget_exploration()
+        temperature = float(explore_cfg['temperature'])
+        epsilon = float(explore_cfg['epsilon'])
+        sampled_columns = []
+        behavior_logp_columns = []
+        buckets = ((0, 1), (2, 3), (4, 5), (6, 7), (8, 9))
+        bucket_logp = -math.log(float(len(buckets)))
+        for bucket in buckets:
+            bucket_ids = torch.tensor(bucket, device=budget_action_logits_old.device, dtype=torch.long)
+            bucket_logits = budget_action_logits_old[:, bucket_ids] / temperature
+            bucket_probs = F.softmax(bucket_logits, dim=-1)
+            bucket_behavior_probs = (1.0 - epsilon) * bucket_probs + epsilon / float(len(bucket))
+            bucket_choice = torch.distributions.Categorical(probs=bucket_behavior_probs).sample()
+            sampled_ids = bucket_ids[bucket_choice]
+            sampled_logp = torch.log(bucket_behavior_probs).gather(
+                dim=1,
+                index=bucket_choice.unsqueeze(1),
+            ).squeeze(1) + bucket_logp
+            sampled_columns.append(sampled_ids)
+            behavior_logp_columns.append(sampled_logp)
+        return torch.stack(sampled_columns, dim=1).contiguous(), torch.stack(behavior_logp_columns, dim=1).contiguous()
+
+    def _resolve_stage2_full_budget_driving_loss(self, full_budget_driving_loss, device, dtype, batch_size):
+        if full_budget_driving_loss is None:
+            raise ValueError("stage2 GRPO requires full_budget_driving_loss from dataset.full_budget_losses_jsonl")
+        if not torch.is_tensor(full_budget_driving_loss):
+            full_budget_driving_loss = torch.as_tensor(full_budget_driving_loss, dtype=torch.float32)
+        full_budget_driving_loss = full_budget_driving_loss.to(device=device, dtype=dtype).view(-1)
+        if int(full_budget_driving_loss.size(0)) != int(batch_size):
+            raise ValueError(
+                f"full_budget_driving_loss batch mismatch: {int(full_budget_driving_loss.size(0))} vs {int(batch_size)}"
+            )
+        return full_budget_driving_loss
+
+    def _forward_stage2_forced_action_driving(self, stage2_forward_kwargs, forced_action_ids):
+        previous_forced_ids = self.adaption_assigner.forced_budget_action_ids
+        previous_collecting = self._stage2_grpo_collecting_rollout
+        previous_update_history = self._stage2_grpo_update_history
+        self.adaption_assigner.set_forced_budget_action_ids(forced_action_ids)
+        self._stage2_grpo_collecting_rollout = True
+        self._stage2_grpo_update_history = False
+        try:
+            with torch.no_grad():
+                rollout_losses = self.forward_train(**stage2_forward_kwargs)
+        finally:
+            self.adaption_assigner.set_forced_budget_action_ids(previous_forced_ids)
+            self._stage2_grpo_collecting_rollout = previous_collecting
+            self._stage2_grpo_update_history = previous_update_history
+        return rollout_losses['stage2_rollout_driving'].float()
+
+    def _build_stage2_grpo_rollout_cache(self, stage2_forward_kwargs, training_signals, full_budget_driving_loss):
+        budget_action_logits_old = training_signals['budget_action_logits'].float().detach()
+        sampled_action_ids, behavior_logp = self._sample_stage2_grpo_rollout_actions(budget_action_logits_old)
+        rollout_driving = []
+        for group_idx in range(int(sampled_action_ids.size(1))):
+            rollout_driving.append(
+                self._forward_stage2_forced_action_driving(
+                    stage2_forward_kwargs=stage2_forward_kwargs,
+                    forced_action_ids=sampled_action_ids[:, group_idx],
+                )
+            )
+        rollout_driving = torch.stack(rollout_driving, dim=1)
+        action_table = self.adaption_assigner._resolve_budget_action_values(
+            device=rollout_driving.device,
+            dtype=rollout_driving.dtype,
+        )
+        sampled_budget_values = action_table[sampled_action_ids.to(device=rollout_driving.device)]
+        budget_min = float(training_signals['budget_min'].item())
+        budget_normalized = (sampled_budget_values - budget_min) / max(1.0 - budget_min, 1e-6)
+        distill_gap = rollout_driving - full_budget_driving_loss.unsqueeze(1)
+        reward_items = self._compute_stage2_grpo_rewards(
+            stage2_cfg=self.adaption_stage2_grpo_cfg,
+            distill_gap=distill_gap,
+            full_budget_driving_loss=full_budget_driving_loss,
+            budget_normalized=budget_normalized,
+        )
+        rewards = reward_items['rewards']
+        reward_mean = rewards.mean(dim=1, keepdim=True)
+        reward_std = rewards.std(dim=1, unbiased=False, keepdim=True)
+        advantages_rel = (rewards - reward_mean) / (reward_std + float(self.adaption_stage2_grpo_cfg.get('grpo_adv_eps', 1e-6)))
+        abs_advantage = torch.tanh(
+            (rewards - float(self.adaption_stage2_grpo_cfg.get('grpo_abs_reward_target', 0.0)))
+            / float(self.adaption_stage2_grpo_cfg.get('grpo_abs_reward_scale', 1.0))
+        )
+        advantages = advantages_rel + float(self.adaption_stage2_grpo_cfg.get('grpo_abs_reward_weight', 0.2)) * abs_advantage
+        return {
+            'budget_action_logits_old': budget_action_logits_old,
+            'sampled_action_ids': sampled_action_ids.detach(),
+            'behavior_logp': behavior_logp.detach(),
+            'advantages': advantages.detach(),
+            'advantages_rel': advantages_rel.detach(),
+            'abs_advantage': abs_advantage.detach(),
+            'rewards': rewards.detach(),
+            'distill_gap': distill_gap.detach(),
+            'allowed_gap': reward_items['allowed_gap'].detach(),
+            'slack': reward_items['slack'].detach(),
+            'gate': reward_items['gate'].detach(),
+            'budget_normalized': budget_normalized.detach(),
+        }
+
+    def _compute_stage2_grpo_policy_loss(self, training_signals, rollout_cache):
+        budget_action_logits_new = training_signals['budget_action_logits'].float()
+        budget_action_logits_old = rollout_cache['budget_action_logits_old'].to(
+            device=budget_action_logits_new.device,
+            dtype=torch.float32,
+        )
+        sampled_action_ids = rollout_cache['sampled_action_ids'].to(
+            device=budget_action_logits_new.device,
+            dtype=torch.long,
+        )
+        behavior_logp = rollout_cache['behavior_logp'].to(device=budget_action_logits_new.device, dtype=torch.float32)
+        advantages = rollout_cache['advantages'].to(device=budget_action_logits_new.device, dtype=torch.float32)
+
+        logp_new_all = F.log_softmax(budget_action_logits_new, dim=-1)
+        logp_old_all = F.log_softmax(budget_action_logits_old, dim=-1)
+        logp_new = logp_new_all.gather(dim=1, index=sampled_action_ids)
+        ratio = torch.exp(logp_new - behavior_logp)
+        clip_eps = float(self.adaption_stage2_grpo_cfg.get('grpo_clip_eps', 0.2))
+        ratio_clipped = ratio.clamp(min=1.0 - clip_eps, max=1.0 + clip_eps)
+        surrogate = torch.minimum(ratio * advantages, ratio_clipped * advantages)
+        clipped_policy = -surrogate.mean()
+
+        probs_new = logp_new_all.exp()
+        kl_new_old = (probs_new * (logp_new_all - logp_old_all)).sum(dim=-1).mean()
+        entropy = -(probs_new * logp_new_all).sum(dim=-1).mean()
+        entropy_norm = entropy / math.log(max(int(budget_action_logits_new.size(1)), 2))
+        entropy_term = entropy_norm if bool(self.adaption_stage2_grpo_cfg.get('grpo_entropy_normalize', True)) else entropy
+        entropy_beta = budget_action_logits_new.new_tensor(
+            self._compute_stage2_entropy_beta(int(self._stage2_grpo_global_step) * self.get_stage2_grpo_update_epochs() + int(self._stage2_grpo_update_idx))
+        )
+        policy_loss = (
+            clipped_policy
+            + float(self.adaption_stage2_grpo_cfg.get('grpo_kl_beta', 0.005)) * kl_new_old
+            - entropy_beta * entropy_term
+        )
+        argmax_action_ids = budget_action_logits_new.argmax(dim=-1)
+        argmax_hist = torch.bincount(argmax_action_ids, minlength=int(budget_action_logits_new.size(1))).to(
+            device=budget_action_logits_new.device,
+            dtype=budget_action_logits_new.dtype,
+        )
+        argmax_frac = argmax_hist / max(int(argmax_action_ids.numel()), 1)
+        metrics = {
+            'grpo_reward_mean': rollout_cache['rewards'].to(budget_action_logits_new.device).mean(),
+            'grpo_reward_std': rollout_cache['rewards'].to(budget_action_logits_new.device).std(unbiased=False),
+            'grpo_advantage_mean': advantages.mean(),
+            'grpo_advantage_std': advantages.std(unbiased=False),
+            'grpo_ratio_mean': ratio.mean(),
+            'grpo_ratio_std': ratio.std(unbiased=False),
+            'grpo_clip_fraction': (torch.abs(ratio - 1.0) > clip_eps).float().mean(),
+            'grpo_kl_new_old': kl_new_old,
+            'grpo_entropy': entropy,
+            'grpo_entropy_norm': entropy_norm,
+            'grpo_entropy_beta': entropy_beta,
+            'stage2_budget_mean': training_signals['budget_values'].float().mean(),
+            'stage2_budget_std': training_signals['budget_values'].float().std(unbiased=False),
+            'stage2_distill_gap_mean': rollout_cache['distill_gap'].to(budget_action_logits_new.device).mean(),
+            'stage2_allowed_gap_mean': rollout_cache['allowed_gap'].to(budget_action_logits_new.device).mean(),
+            'stage2_slack_mean': rollout_cache['slack'].to(budget_action_logits_new.device).mean(),
+            'stage2_gate_mean': rollout_cache['gate'].to(budget_action_logits_new.device).mean(),
+            'stage2_budget_norm_mean': rollout_cache['budget_normalized'].to(budget_action_logits_new.device).mean(),
+        }
+        if training_signals.get('budget_query_feat_std', None) is not None:
+            metrics['stage2_budget_query_feat_std'] = training_signals['budget_query_feat_std']
+        for action_idx in range(int(budget_action_logits_new.size(1))):
+            metrics[f'grpo_argmax_action_frac_{action_idx}'] = argmax_frac[action_idx]
+        return policy_loss, metrics
 
     def _compute_stage1_aux_lambda_div(self, global_step: int) -> float:
         ratio_start = float(self.adaption_stage1_aux_div_ratio_start)
@@ -780,6 +1381,7 @@ class Orion(MVXTwoStageDetector):
                       input_ids=None,
                       vlm_labels=None,
                       ego_fut_trajs = None,
+                      full_budget_driving_loss=None,
                       **data):
         """Forward training function.
         Args:
@@ -804,6 +1406,9 @@ class Orion(MVXTwoStageDetector):
         Returns:
             dict: Losses of different branches.
         """
+        raw_img_metas = img_metas
+        raw_input_ids = input_ids
+        raw_vlm_labels = vlm_labels
         if self.test_flag: #for interval evaluation
             self.pts_bbox_head.reset_memory()
             self.test_flag = False
@@ -827,7 +1432,36 @@ class Orion(MVXTwoStageDetector):
         img_metas = self._select_current_frame_img_metas(img_metas)
 
         data['img_feats'] = self.extract_feat(data['img'])
-        losses = self.forward_pts_train(gt_bboxes_3d, gt_labels_3d, gt_attr_labels,map_gt_bboxes_3d, map_gt_labels_3d, img_metas,input_ids, vlm_labels, vlm_attn_mask, ego_fut_trajs,**data)
+        stage2_forward_kwargs = None
+        if self.adaption_stage2_enabled:
+            stage2_forward_kwargs = dict(
+                img_metas=raw_img_metas,
+                gt_bboxes_3d=gt_bboxes_3d,
+                gt_labels_3d=gt_labels_3d,
+                gt_attr_labels=gt_attr_labels,
+                map_gt_bboxes_3d=map_gt_bboxes_3d,
+                map_gt_labels_3d=map_gt_labels_3d,
+                input_ids=[item.detach().clone() for item in raw_input_ids],
+                vlm_labels=[item.detach().clone() for item in raw_vlm_labels],
+                ego_fut_trajs=ego_fut_trajs,
+                full_budget_driving_loss=full_budget_driving_loss,
+                **{key: value for key, value in data.items() if key != 'img_feats'},
+            )
+        losses = self.forward_pts_train(
+            gt_bboxes_3d,
+            gt_labels_3d,
+            gt_attr_labels,
+            map_gt_bboxes_3d,
+            map_gt_labels_3d,
+            img_metas,
+            input_ids,
+            vlm_labels,
+            vlm_attn_mask,
+            ego_fut_trajs,
+            full_budget_driving_loss=full_budget_driving_loss,
+            stage2_forward_kwargs=stage2_forward_kwargs,
+            **data,
+        )
 
         return losses
 
@@ -843,6 +1477,8 @@ class Orion(MVXTwoStageDetector):
                           vlm_labels, 
                           vlm_attn_mask,
                           ego_fut_trajs,
+                          full_budget_driving_loss=None,
+                          stage2_forward_kwargs=None,
                           **data):
         """Forward function for point cloud branch.
         Args:
@@ -862,11 +1498,12 @@ class Orion(MVXTwoStageDetector):
         pos_embed = self.position_embeding(data, location, img_metas) # (1, 9600, 256)
         losses = dict()
         agent_outs = None
+        suppress_primary_losses = bool(self.adaption_stage2_enabled)
 
         if self.with_pts_bbox:
             outs_bbox, det_query, current_scene_queries = self.pts_bbox_head(img_metas, pos_embed, **data) # (1, 257, 4096)
             vision_embeded_obj = det_query.clone()
-            if self.use_col_loss or not self.adaption_stage1_enabled:
+            if self.use_col_loss or (not self.adaption_stage1_enabled and not suppress_primary_losses):
                 loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs_bbox, gt_attr_labels]
                 if self.pts_bbox_head.pred_traffic_light_state:
                     loss_inputs.append(data['traffic_state'])
@@ -875,13 +1512,13 @@ class Orion(MVXTwoStageDetector):
                     loss, agent_outs = self.pts_bbox_head.loss(*loss_inputs)
                 else:
                     loss = self.pts_bbox_head.loss(*loss_inputs)
-                if not self.adaption_stage1_enabled:
+                if not self.adaption_stage1_enabled and not suppress_primary_losses:
                     losses.update(loss)
             
         if self.with_map_head:
             outs_lane, map_query = self.map_head(img_metas, pos_embed, **data)
             vision_embeded_map = map_query.clone()
-            if not self.adaption_stage1_enabled:
+            if not self.adaption_stage1_enabled and not suppress_primary_losses:
                 # reference vad trans
                 device = gt_labels_3d[0].device
                 map_gt_vecs_list = copy.deepcopy(map_gt_bboxes_3d)
@@ -919,15 +1556,29 @@ class Orion(MVXTwoStageDetector):
                     sample_idxs=list(range(B)),
                 )
             if self.use_gen_token:
-                vlm_loss, ego_feature = self.lm_head(
-                    input_ids=input_ids,
-                    attention_mask=vlm_attn_mask,
-                    labels=vlm_labels,
-                    images=vision_embeded,
-                    use_cache=False,
-                    return_ego_feature=True,
-                    adalava_controller=self.adaption_assigner,
-                )
+                if self.adaption_stage2_enabled:
+                    vlm_outputs, ego_feature, vlm_loss_per_sample = self.lm_head(
+                        input_ids=input_ids,
+                        attention_mask=vlm_attn_mask,
+                        labels=vlm_labels,
+                        images=vision_embeded,
+                        use_cache=False,
+                        return_ego_feature=True,
+                        return_loss_per_sample=True,
+                        adalava_controller=self.adaption_assigner,
+                    )
+                    vlm_loss = vlm_outputs
+                else:
+                    vlm_loss, ego_feature = self.lm_head(
+                        input_ids=input_ids,
+                        attention_mask=vlm_attn_mask,
+                        labels=vlm_labels,
+                        images=vision_embeded,
+                        use_cache=False,
+                        return_ego_feature=True,
+                        adalava_controller=self.adaption_assigner,
+                    )
+                    vlm_loss_per_sample = None
                 if self.mix_qa_training:
                     dummy_ego_feature = self.lm_head.get_model().embed_tokens(torch.tensor([[self.lm_head.config.waypoint_token_idx] for _ in range(B)]).cuda())
                     dummy_ego_feature = dummy_ego_feature.squeeze(1).to(dtype=ego_feature.dtype)
@@ -935,7 +1586,8 @@ class Orion(MVXTwoStageDetector):
                     dummy_ego_feature[valid_input_mask] = ego_feature
                     ego_feature = dummy_ego_feature
                     data['ego_fut_masks'][:,0,0] *= valid_input_mask.unsqueeze(-1)
-                losses.update(vlm_loss=vlm_loss[0])
+                if not suppress_primary_losses:
+                    losses.update(vlm_loss=vlm_loss[0])
                 current_states = ego_feature.unsqueeze(1)
 
                 if not self.use_diff_decoder and not self.use_mlp_decoder:
@@ -979,14 +1631,47 @@ class Orion(MVXTwoStageDetector):
                         loss_planning_dict = self.loss_planning(*loss_plan_input, **agent_outs)
                     else:
                         loss_planning_dict = self.loss_planning(*loss_plan_input)
-                    losses.update(loss_planning_dict)
+                    if not suppress_primary_losses:
+                        losses.update(loss_planning_dict)
                     sceneaware_future_trajs = self._select_train_sceneaware_future_trajs(
                         data=data,
                         ego_fut_preds=ego_fut_preds,
                     )
                     loss_vae_gen = self.loss_vae_gen(distribution_comp, data['ego_fut_masks'][:,0,0])
                     loss_vae_gen = torch.nan_to_num(loss_vae_gen)
-                    losses.update(loss_vae_gen=loss_vae_gen)
+                    if not suppress_primary_losses:
+                        losses.update(loss_vae_gen=loss_vae_gen)
+                    if self.adaption_stage2_enabled:
+                        ego_masks = data['ego_fut_masks'][:, 0, 0]
+                        ego_cmd = data['ego_fut_cmd'][:, 0, 0]
+                        stage2_plan_reg = self._loss_plan_reg_per_sample(
+                            ego_fut_preds,
+                            ego_fut_trajs[:, 0],
+                            ego_masks,
+                            ego_cmd,
+                        )
+                        stage2_plan_bound = self._loss_plan_bound_per_sample(
+                            ego_fut_preds,
+                            ego_masks,
+                            ego_cmd,
+                            lane_preds,
+                            lane_scores,
+                        ) if self.with_bound_loss else torch.zeros_like(stage2_plan_reg)
+                        if self.use_col_loss:
+                            stage2_plan_col = self._loss_plan_col_per_sample(
+                                ego_fut_preds,
+                                ego_masks,
+                                ego_cmd,
+                                **agent_outs,
+                            )
+                        else:
+                            stage2_plan_col = torch.zeros_like(stage2_plan_reg)
+                        stage2_vae = self._loss_vae_gen_per_sample(output_distribution, ego_masks)
+                        stage2_vlm = torch.nan_to_num(vlm_loss_per_sample.to(device=stage2_plan_reg.device))
+                        stage2_driving = stage2_vlm + stage2_plan_reg + stage2_plan_bound + stage2_vae
+                        if self.use_col_loss:
+                            stage2_driving = stage2_driving + stage2_plan_col
+                        losses['stage2_rollout_driving'] = torch.nan_to_num(stage2_driving)
                 elif self.use_diff_decoder:
                     bs = B
                     device = ego_feature.device
@@ -1074,10 +1759,37 @@ class Orion(MVXTwoStageDetector):
                 losses.update(self._build_stage1_runtime_log_dict())
             if self.adaption_stage1_enabled and self.adaption_stage1_aux_enabled:
                 losses.update(self._build_stage1_aux_loss_dict())
+            if self.adaption_stage2_enabled:
+                if 'stage2_rollout_driving' not in losses:
+                    raise ValueError("stage2 GRPO currently requires VAE planning path to produce driving scores")
+                if self._stage2_grpo_collecting_rollout:
+                    return {'stage2_rollout_driving': losses['stage2_rollout_driving']}
+                training_signals = self.adaption_assigner.get_stage2_grpo_training_signals()
+                full_budget_driving = self._resolve_stage2_full_budget_driving_loss(
+                    full_budget_driving_loss=full_budget_driving_loss,
+                    device=training_signals['budget_action_logits'].device,
+                    dtype=training_signals['budget_action_logits'].dtype,
+                    batch_size=int(training_signals['budget_action_logits'].size(0)),
+                )
+                if self._stage2_grpo_rollout_cache is None:
+                    if stage2_forward_kwargs is None:
+                        raise ValueError("stage2_forward_kwargs is required to build GRPO rollout cache")
+                    self._stage2_grpo_rollout_cache = self._build_stage2_grpo_rollout_cache(
+                        stage2_forward_kwargs=stage2_forward_kwargs,
+                        training_signals=training_signals,
+                        full_budget_driving_loss=full_budget_driving,
+                    )
+                policy_loss, stage2_metrics = self._compute_stage2_grpo_policy_loss(
+                    training_signals=training_signals,
+                    rollout_cache=self._stage2_grpo_rollout_cache,
+                )
+                losses = {'loss_grpo': torch.nan_to_num(policy_loss)}
+                losses.update({key: torch.nan_to_num(value) for key, value in stage2_metrics.items()})
             if (
                 self.adaption_sceneaware_enabled
                 and current_visual_queries is not None
                 and sceneaware_future_trajs is not None
+                and (not self.adaption_stage2_enabled or self._stage2_grpo_update_history)
             ):
                 self.adaption_assigner.update_sceneaware_history_after_llm(
                     route_keys=self._extract_route_keys(img_metas),
