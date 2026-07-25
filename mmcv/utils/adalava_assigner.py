@@ -172,7 +172,11 @@ class OrionBudgetAssigner(nn.Module):
         self.budget_query_embed = nn.Parameter(torch.empty(1, self.hidden_size))
         self.path_query_embed = nn.Parameter(torch.empty(1, self.hidden_size))
         self.budget_scheduler = nn.Sequential(
+            nn.LayerNorm(self.hidden_size * 5),
             nn.Linear(self.hidden_size * 5, self.hidden_size),
+            nn.SiLU(),
+            nn.LayerNorm(self.hidden_size),
+            nn.Linear(self.hidden_size, self.hidden_size),
             nn.SiLU(),
             nn.Linear(self.hidden_size, self.budget_num_actions),
         )
@@ -231,6 +235,9 @@ class OrionBudgetAssigner(nn.Module):
                     nn.init.normal_(submodule.weight, mean=0.0, std=0.02)
                     if submodule.bias is not None:
                         nn.init.zeros_(submodule.bias)
+        # 关键调用点：stage2 policy 从均匀 logits 起步，避免随机大输入把熵直接压到 0。
+        nn.init.zeros_(self.budget_scheduler[-1].weight)
+        nn.init.zeros_(self.budget_scheduler[-1].bias)
 
     def reset_runtime_state(self):
         self.budget_query_positions = None

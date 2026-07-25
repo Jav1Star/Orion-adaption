@@ -115,10 +115,16 @@ def init_dist(launcher, backend='nccl', **kwargs):
 
 
 def _init_dist_pytorch(backend, **kwargs):
-    # TODO: use local_rank instead of rank % num_gpus
     rank = int(os.environ['RANK'])
+    local_rank = int(os.environ.get('LOCAL_RANK', rank))
     num_gpus = torch.cuda.device_count()
-    torch.cuda.set_device(rank % num_gpus)
+    if local_rank >= num_gpus:
+        raise RuntimeError(
+            f'LOCAL_RANK={local_rank} requires at least {local_rank + 1} visible CUDA devices, '
+            f'but torch.cuda.device_count()={num_gpus}. '
+            'Reduce GPUS/nproc_per_node or set CUDA_VISIBLE_DEVICES to enough unique GPUs.'
+        )
+    torch.cuda.set_device(local_rank)
     print("nccl timeout value is set as 3600s!")
     dist.init_process_group(backend=backend, timeout=timedelta(seconds=3600), **kwargs)
 

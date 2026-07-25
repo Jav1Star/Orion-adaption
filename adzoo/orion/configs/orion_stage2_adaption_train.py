@@ -1,7 +1,13 @@
 _base_ = ["./orion_stage1_adaption_train.py"]
 
-full_budget_losses_jsonl = "data/orion/stage2_full_budget_losses/train_lfull_stage2_all.jsonl"
+from datetime import datetime
 
+run_name = f"orion_stage2_{datetime.now().strftime('%m%d_%H%M')}_budget_only_grpo"
+work_dir = f"work_dirs/{run_name}"
+del datetime
+
+stage1_adaption_checkpoint = "work_dirs/orion_stage1_0720_1751/iter_468000.pth"
+full_budget_losses_jsonl = "data/infos/full_budget_losses/orion_stage1_0720_1751_full_budget_all.jsonl"
 orion_adaption_cfg = dict(
     enabled={{_base_.orion_adaption_cfg.enabled}},
     num_prefix_layers={{_base_.orion_adaption_cfg.num_prefix_layers}},
@@ -63,13 +69,36 @@ orion_adaption_cfg = dict(
 )
 
 model = dict(adaption_cfg=orion_adaption_cfg)
+samples_per_gpu = 1
+data = dict(
+    samples_per_gpu=samples_per_gpu,
+    train=dict(full_budget_losses_jsonl=full_budget_losses_jsonl),
+)
 
-data = dict(train=dict(full_budget_losses_jsonl=full_budget_losses_jsonl))
+# 关键调用点：stage2 参考 SimLingo v2 的 1e-4 policy LR；避免继承 stage1 head_decay_rate=4 后实际变成 4e-4。
+optimizer = dict(
+    lr=1e-4,
+    paramwise_cfg=dict(
+        decay_rate=1.0,
+        head_decay_rate=1.0,
+        lm_head_decay_rate=1.0,
+    ),
+)
+load_from = stage1_adaption_checkpoint
+resume_from = None
 
-optimizer = dict(lr=1e-4)
+# 关键调用点：stage2 policy-only 训练使用约 0.5% warmup 和非零 floor，对齐 SimLingo v3 的调度形状。
+lr_config = dict(
+    policy="CosineAnnealing",
+    warmup="linear",
+    warmup_iters=2500,
+    warmup_ratio=0.1,
+    min_lr_ratio=0.1,
+)
 
 # 关键调用点：stage2 同一 rollout 需要多次更新，不能使用跨 batch 的累积梯度 hook。
 optimizer_config = dict(
+    _delete_=True,
     type="OrionStage2GRPOOptimizerHook",
     grad_clip=dict(max_norm=35, norm_type=2),
 )

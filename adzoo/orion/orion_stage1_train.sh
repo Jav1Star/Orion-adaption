@@ -7,7 +7,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 ORION_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
 # 关键调用点：stage1 训练固定走这一份 config，避免把不必要的路径选择暴露成日常操作成本。
-CFG_PATH=${CFG_PATH:-"$ORION_ROOT/adzoo/orion/configs/orion_stage1_adaption_train.py"}
+CFG_PATH=${CFG_PATH:-"$ORION_ROOT/adzoo/orion/configs/orion_stage1_adaption_train_with_col_loss.py"}
 CONDA_ENV=${CONDA_ENV:-simlingo_310}
 GPU_ID=${GPU_ID:-0}
 RUN_NAME=${RUN_NAME:-"orion_stage1_${RUN_TS}"}

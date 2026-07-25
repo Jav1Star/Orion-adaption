@@ -89,6 +89,14 @@ def parse_args():
         help="DataLoader prefetch_factor when workers > 0",
     )
     parser.add_argument("--resume", action="store_true", help="append missing rows from an existing output_jsonl")
+    parser.add_argument(
+        "--done-jsonl",
+        action="append",
+        default=[],
+        help="existing _all.jsonl to use as finished rows without writing to it; can be passed multiple times",
+    )
+    parser.add_argument("--num-route-shards", type=int, default=1, help="split routes into this many deterministic shards")
+    parser.add_argument("--route-shard-id", type=int, default=0, help="current route shard id, in [0, num_route_shards)")
     return parser.parse_args()
 
 
@@ -247,6 +255,103 @@ def validate_existing_paths(existing_paths: Set[str], record_by_measurement: Dic
     missing_paths = sorted(existing_paths - set(record_by_measurement.keys()))
     if missing_paths:
         raise ValueError(f"{jsonl_path} contains measurement_path not in current dataset: {missing_paths[0]}")
+
+
+def load_finished_from_done_jsonls(done_jsonls: Sequence[str], record_by_measurement: Dict[str, SampleRecord]):
+    done_measurements: Set[str] = set()
+    skipped_measurements: Set[str] = set()
+    for done_jsonl_arg in done_jsonls:
+        done_jsonl = Path(done_jsonl_arg)
+        done_paths = load_measurement_paths(done_jsonl, require_loss=True)
+        skip_jsonl = skipped_jsonl_path(done_jsonl)
+        skip_paths = load_measurement_paths(skip_jsonl, require_loss=False)
+        validate_existing_paths(done_paths, record_by_measurement, done_jsonl)
+        validate_existing_paths(skip_paths, record_by_measurement, skip_jsonl)
+        duplicated = done_measurements & done_paths
+        if duplicated:
+            raise ValueError(f"duplicated measurement_path across done jsonls: {sorted(duplicated)[0]}")
+        done_measurements.update(done_paths)
+        skipped_measurements.update(skip_paths)
+    return done_measurements, skipped_measurements
+
+
+def select_route_shard(
+    partition_records: Sequence[SampleRecord],
+    pending_records: Sequence[SampleRecord],
+    num_shards: int,
+    shard_id: int,
+):
+    if num_shards <= 0:
+        raise ValueError(f"num_route_shards must be >= 1, got {num_shards}")
+    if shard_id < 0 or shard_id >= num_shards:
+        raise ValueError(f"route_shard_id must be in [0, {num_shards}), got {shard_id}")
+    if num_shards == 1:
+        return list(pending_records), len(partition_records)
+
+    route_to_count: Dict[str, int] = defaultdict(int)
+    for record in partition_records:
+        route_to_count[record.route_key] += 1
+
+    # 关键调用点：分片只按完整 route 分配，避免多进程破坏 scene-aware history。
+    shard_loads = [0 for _ in range(num_shards)]
+    route_to_shard: Dict[str, int] = {}
+    for route_key, route_count in sorted(route_to_count.items(), key=lambda item: (-item[1], item[0])):
+        target_shard = min(range(num_shards), key=lambda idx: (shard_loads[idx], idx))
+        route_to_shard[route_key] = target_shard
+        shard_loads[target_shard] += route_count
+
+    return [record for record in pending_records if route_to_shard[record.route_key] == shard_id], shard_loads[shard_id]
+
+
+def _align_head_temporal_memory(head, previous_route_keys: Optional[List[str]], current_route_keys: List[str]):
+    if previous_route_keys is None or previous_route_keys == current_route_keys:
+        return
+    if getattr(head, "memory_embedding", None) is None:
+        return
+
+    previous_pos = {route_key: idx for idx, route_key in enumerate(previous_route_keys)}
+    memory_attrs = [
+        "memory_embedding",
+        "memory_reference_point",
+        "memory_timestamp",
+        "memory_egopose",
+        "memory_velo",
+        "sample_time",
+        "memory_canbus",
+        "his_memory_canbus_len",
+        "memory_scene_query",
+        "scene_memory_timestamp",
+        "memory_mask",
+    ]
+    for attr in memory_attrs:
+        value = getattr(head, attr, None)
+        if not torch.is_tensor(value) or value.dim() == 0 or value.size(0) != len(previous_route_keys):
+            continue
+        rows = []
+        for route_key in current_route_keys:
+            previous_idx = previous_pos.get(route_key, None)
+            if previous_idx is None:
+                rows.append(torch.zeros_like(value[:1]))
+            else:
+                rows.append(value[previous_idx:previous_idx + 1])
+        setattr(head, attr, torch.cat(rows, dim=0))
+
+    memory_scene_tokens = getattr(head, "memory_scene_tokens", None)
+    if isinstance(memory_scene_tokens, list) and len(memory_scene_tokens) == len(previous_route_keys):
+        head.memory_scene_tokens = [
+            memory_scene_tokens[previous_pos[route_key]] if route_key in previous_pos else ""
+            for route_key in current_route_keys
+        ]
+
+
+def align_model_temporal_memory(model, previous_route_keys: Optional[List[str]], current_route_keys: List[str]):
+    # 关键调用点：fixed-slot 调度在 route 结束时会压缩 slot，collection 需要同步压缩模型缓存。
+    if previous_route_keys is None or previous_route_keys == current_route_keys:
+        return
+    if getattr(model, "pts_bbox_head", None) is not None:
+        _align_head_temporal_memory(model.pts_bbox_head, previous_route_keys, current_route_keys)
+    if getattr(model, "map_head", None) is not None:
+        _align_head_temporal_memory(model.map_head, previous_route_keys, current_route_keys)
 
 
 def build_resume_warmup_records(
@@ -455,16 +560,36 @@ def main():
     record_by_index = {record.index: record for record in records}
     record_by_measurement = {record.measurement_path: record for record in records}
     skip_jsonl = skipped_jsonl_path(output_jsonl)
-    done_measurements = load_measurement_paths(output_jsonl, require_loss=True) if args.resume else set()
-    existing_skipped_measurements = load_measurement_paths(skip_jsonl, require_loss=False) if args.resume else set()
-    validate_existing_paths(done_measurements, record_by_measurement, output_jsonl)
-    validate_existing_paths(existing_skipped_measurements, record_by_measurement, skip_jsonl)
+    done_measurements, existing_skipped_measurements = load_finished_from_done_jsonls(
+        args.done_jsonl,
+        record_by_measurement,
+    )
+    external_finished_measurements = done_measurements | existing_skipped_measurements
+    output_done_measurements = load_measurement_paths(output_jsonl, require_loss=True) if args.resume else set()
+    output_skipped_measurements = load_measurement_paths(skip_jsonl, require_loss=False) if args.resume else set()
+    validate_existing_paths(output_done_measurements, record_by_measurement, output_jsonl)
+    validate_existing_paths(output_skipped_measurements, record_by_measurement, skip_jsonl)
+    duplicated_done = done_measurements & output_done_measurements
+    if duplicated_done:
+        raise ValueError(f"output_jsonl duplicates done-jsonl measurement_path: {sorted(duplicated_done)[0]}")
+    done_measurements.update(output_done_measurements)
+    existing_skipped_measurements.update(output_skipped_measurements)
     duplicated_finished = done_measurements & existing_skipped_measurements
     if duplicated_finished:
         raise ValueError(f"measurement_path appears in both output and skipped jsonl: {sorted(duplicated_finished)[0]}")
 
     finished_measurements = done_measurements | existing_skipped_measurements
-    pending_records = [record for record in records if record.measurement_path not in finished_measurements]
+    shard_partition_records = [
+        record for record in records
+        if record.measurement_path not in external_finished_measurements
+    ]
+    all_pending_records = [record for record in records if record.measurement_path not in finished_measurements]
+    pending_records, shard_total_records = select_route_shard(
+        partition_records=shard_partition_records,
+        pending_records=all_pending_records,
+        num_shards=args.num_route_shards,
+        shard_id=args.route_shard_id,
+    )
     warmup_history_len = 2 * int(getattr(dataset, "sample_interval", 1)) + 1
     warmup_records = build_resume_warmup_records(
         records=records,
@@ -478,7 +603,10 @@ def main():
         f"existing_done={len(done_measurements)}, "
         f"existing_skipped={len(existing_skipped_measurements)}, "
         f"warmup={len(warmup_records)}, "
-        f"remaining={len(pending_records)}"
+        f"global_remaining={len(all_pending_records)}, "
+        f"shard={args.route_shard_id}/{args.num_route_shards}, "
+        f"shard_total={shard_total_records}, "
+        f"shard_remaining={len(pending_records)}"
     )
     if len(pending_records) == 0:
         print(f"[collect] nothing to collect, total records already finished: {len(records)}")
@@ -521,6 +649,7 @@ def main():
 
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     warmup_skipped = 0
+    previous_route_keys = None
     for batch in warmup_iter:
         skipped_items = batch.pop("_collect_skips", [])
         if skipped_items:
@@ -530,12 +659,15 @@ def main():
             continue
         batch_records = [record_by_index[int(index)] for index in collect_indices]
         assert_batch_matches_records(batch, batch_records)
+        current_route_keys = [record.route_key for record in batch_records]
+        align_model_temporal_memory(model, previous_route_keys, current_route_keys)
         batch = move_to_device(batch, torch.device("cuda"))
         with torch.no_grad():
             model.collect_full_budget_losses(
                 forced_budget_value=1.0,
                 **batch,
             )
+        previous_route_keys = current_route_keys
     if warmup_records:
         print(f"[collect] warmup finished: forwarded={len(warmup_records) - warmup_skipped}, skipped={warmup_skipped}")
 
@@ -545,7 +677,7 @@ def main():
     skipped = 0
     with output_jsonl.open(output_mode, encoding="utf-8") as fout, skip_jsonl.open(skipped_mode, encoding="utf-8") as fskip:
         with tqdm(
-            total=len(records),
+            total=len(finished_measurements) + len(pending_records),
             initial=len(finished_measurements),
             desc="collect full-budget losses",
         ) as progress:
@@ -560,20 +692,24 @@ def main():
                     continue
                 batch_records = [record_by_index[int(index)] for index in collect_indices]
                 assert_batch_matches_records(batch, batch_records)
+                current_route_keys = [record.route_key for record in batch_records]
+                align_model_temporal_memory(model, previous_route_keys, current_route_keys)
                 batch = move_to_device(batch, torch.device("cuda"))
                 with torch.no_grad():
                     loss_dict = model.collect_full_budget_losses(
                         forced_budget_value=1.0,
                         **batch,
                     )
+                previous_route_keys = current_route_keys
                 write_rows(fout, batch_records, loss_dict)
                 written += len(batch_records)
                 progress.update(len(batch_records))
                 fout.flush()
 
     finished = len(finished_measurements) + written + skipped
-    if finished != len(records):
-        raise RuntimeError(f"output row count mismatch: finished={finished}, expected={len(records)}")
+    expected_finished = len(finished_measurements) + len(pending_records)
+    if finished != expected_finished:
+        raise RuntimeError(f"output row count mismatch: finished={finished}, expected={expected_finished}")
     print(
         "[collect] finished: "
         f"existing={len(done_measurements)}, "

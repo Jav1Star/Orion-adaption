@@ -214,6 +214,7 @@ class B2DOrionDataset(Custom3DDataset):
                 torch.tensor(full_budget_driving_loss, dtype=torch.float32),
                 cpu_only=False,
                 stack=True,
+                pad_dims=None,
             )
         queue = queue[-1]
         return queue
