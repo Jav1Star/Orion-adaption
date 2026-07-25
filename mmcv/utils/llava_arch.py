@@ -178,7 +178,7 @@ class LlavaMetaForCausalLM(ABC):
                             # 关键调用点：stage1 训练与闭环推理共用 scene-aware token 注入顺序。
                             sceneaware_embeds = adalava_controller.get_sceneaware_embeddings(
                                 sample_idx=batch_idx,
-                            ).squeeze(0)
+                            ).squeeze(0).to(device=cur_image_features.device, dtype=cur_image_features.dtype)
                             cur_new_input_embeds.append(sceneaware_embeds)
                             cur_new_labels.append(
                                 torch.full(

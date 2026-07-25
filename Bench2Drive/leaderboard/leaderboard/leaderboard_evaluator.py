@@ -49,17 +49,21 @@ sensors_to_icons = {
     'sensor.speedometer':       'carla_speedometer'
 }
 
-import socket
+def record_carla_pid(label, pid):
+    pid_file = os.environ.get("ORION_CARLA_PID_FILE")
+    if not pid_file:
+        return
+    os.makedirs(os.path.dirname(pid_file), exist_ok=True)
+    with open(pid_file, "a", encoding="utf-8") as outfile:
+        outfile.write("{} {}\n".format(label, pid))
 
-def find_free_port(starting_port):
-    port = starting_port
-    while True:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("localhost", port))
-                return port
-        except OSError:
-            port += 1
+
+def kill_carla_process_group(pid):
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
 
 def get_weather_id(weather_conditions):
     from xml.etree import ElementTree as ET
@@ -200,11 +204,11 @@ class LeaderboardEvaluator(object):
         """
         self.carla_path = os.environ["CARLA_ROOT"]
         startup_wait = float(os.environ.get("CARLA_STARTUP_WAIT", "30"))
-        args.port = find_free_port(args.port)
         cmd1 = f"{os.path.join(self.carla_path, 'CarlaUE4.sh')} -RenderOffScreen -nosound -carla-rpc-port={args.port} -graphicsadapter={args.gpu_rank}"
         self.server = subprocess.Popen(cmd1, shell=True, preexec_fn=os.setsid)
+        record_carla_pid("carla_server", self.server.pid)
         print(cmd1, self.server.returncode, flush=True)
-        atexit.register(os.killpg, self.server.pid, signal.SIGKILL)
+        atexit.register(kill_carla_process_group, self.server.pid)
         print(f"waiting {startup_wait}s for CARLA startup", flush=True)
         time.sleep(startup_wait)
             
@@ -235,7 +239,6 @@ class LeaderboardEvaluator(object):
         num_max_restarts = 40
         while attempts < num_max_restarts:
             try:
-                args.traffic_manager_port = find_free_port(args.traffic_manager_port)
                 traffic_manager = client.get_trafficmanager(args.traffic_manager_port)
                 traffic_manager.set_synchronous_mode(True)
                 traffic_manager.set_hybrid_physics_mode(True)
@@ -500,9 +503,7 @@ class LeaderboardEvaluator(object):
             self.statistics_manager.validate_and_write_statistics(self.sensors_initialized, crashed)
         
         if crashed:
-            cmd2 = "ps -ef | grep '-graphicsadapter="+ str(args.gpu_rank) + "' | grep -v grep | awk '{print $2}' | xargs -r kill -9"
-            server = subprocess.Popen(cmd2, shell=True, preexec_fn=os.setsid)
-            atexit.register(os.killpg, server.pid, signal.SIGKILL)
+            kill_carla_process_group(self.server.pid)
 
         return crashed
 

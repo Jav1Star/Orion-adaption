@@ -135,6 +135,7 @@ class OrionBudgetAssigner(nn.Module):
         sample_interval=5,
         path_gumbel_tau=1.0,
         path_gumbel_hard=True,
+        inference_budget=None,
     ):
         super().__init__()
         self.hidden_size = int(hidden_size)
@@ -158,6 +159,13 @@ class OrionBudgetAssigner(nn.Module):
         self.stage1_budget_curriculum_warmup_steps = int(budget_curriculum_warmup_steps)
         self.path_gumbel_tau = float(path_gumbel_tau)
         self.path_gumbel_hard = bool(path_gumbel_hard)
+        self.inference_budget = None if inference_budget is None else float(inference_budget)
+        if self.inference_budget is not None and (
+            self.inference_budget < self.budget_min or self.inference_budget > 1.0
+        ):
+            raise ValueError(
+                f"inference_budget must be in [{self.budget_min:.6f}, 1.0], got {self.inference_budget}"
+            )
         if self.stage1_budget_curriculum_start_min < self.budget_min or self.stage1_budget_curriculum_start_min > 1.0:
             raise ValueError(
                 "budget_curriculum_start_min must be in "
@@ -756,19 +764,24 @@ class OrionBudgetAssigner(nn.Module):
                 sample_idx=None if sample_idxs is None else sample_idxs[batch_idx],
             )
             reference_entry = self._get_sceneaware_reference_entry(state, frame_idxs[batch_idx])
-            current_traj = current_future_trajs[batch_idx].detach().to(dtype=torch.float32)
-            current_pose = current_ego_poses[batch_idx].detach().to(dtype=torch.float32)
-            current_timestamp = current_timestamps[batch_idx].detach().reshape(()).to(dtype=torch.float32)
+            history_device = current_visual_queries.device
+            # 闭环推理中轨迹结果可能已搬到 CPU；跨帧几何计算必须统一到当前模型设备。
+            current_traj = current_future_trajs[batch_idx].detach().to(device=history_device, dtype=torch.float32)
+            current_pose = current_ego_poses[batch_idx].detach().to(device=history_device, dtype=torch.float32)
+            current_timestamp = current_timestamps[batch_idx].detach().reshape(()).to(
+                device=history_device,
+                dtype=torch.float32,
+            )
 
             prev_future_traj = None if reference_entry is None else reference_entry["future_traj"]
             prev_ego_pose = None if reference_entry is None else reference_entry["ego_pose"]
             prev_timestamp = None if reference_entry is None else reference_entry["timestamp"]
             if prev_future_traj is not None:
-                prev_future_traj = prev_future_traj.to(device=current_traj.device, dtype=torch.float32)
+                prev_future_traj = prev_future_traj.to(device=history_device, dtype=torch.float32)
             if prev_ego_pose is not None:
-                prev_ego_pose = prev_ego_pose.to(device=current_pose.device, dtype=torch.float32)
+                prev_ego_pose = prev_ego_pose.to(device=history_device, dtype=torch.float32)
             if prev_timestamp is not None:
-                prev_timestamp = prev_timestamp.to(device=current_timestamp.device, dtype=torch.float32)
+                prev_timestamp = prev_timestamp.to(device=history_device, dtype=torch.float32)
             cached_traj_dev = self._build_traj_deviation(
                 current_future_traj=current_traj,
                 current_ego_pose=current_pose,
@@ -901,7 +914,16 @@ class OrionBudgetAssigner(nn.Module):
             return hidden_states
 
         budget_hidden = self._gather_query_hidden(hidden_states, self.budget_query_positions)
-        if self.training and self.stage1_enabled:
+        if not self.training and self.inference_budget is not None:
+            budget_values = torch.full(
+                (hidden_states.shape[0],),
+                fill_value=float(self.inference_budget),
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
+        elif not self.training and self.stage1_enabled:
+            raise ValueError("stage1 inference requires adaption_cfg.inference_budget")
+        elif self.training and self.stage1_enabled:
             curriculum_min = self._compute_stage1_curriculum_min()
             budget_values = curriculum_min + (1.0 - curriculum_min) * torch.rand(
                 (hidden_states.shape[0],),

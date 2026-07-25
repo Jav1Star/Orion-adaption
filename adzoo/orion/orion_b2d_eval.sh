@@ -88,6 +88,8 @@ export GPU_RANK
 export GPU_RANK_LIST
 export CARLA_GPU
 export MODEL_GPU
+export ORION_EVAL_MAX_ROUTE_ATTEMPTS=${ORION_EVAL_MAX_ROUTE_ATTEMPTS:-2}
+export ORION_EVAL_ROUTE_IDS=${ORION_EVAL_ROUTE_IDS:-}
 CARLA_PYTHON_DIST=""
 for candidate in \
     "$CARLA_ROOT"/PythonAPI/carla/dist/carla-*py3*.egg \

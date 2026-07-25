@@ -264,6 +264,7 @@ class Orion(MVXTwoStageDetector):
                     sample_interval=self.adaption_sample_interval,
                     path_gumbel_tau=float(self.adaption_cfg.get('path_gumbel_tau', 1.0)),
                     path_gumbel_hard=bool(self.adaption_cfg.get('path_gumbel_hard', True)),
+                    inference_budget=self.adaption_cfg.get('inference_budget', None),
                 )
                 if not self.with_pts_bbox:
                     raise ValueError("scene-aware requires pts_bbox_head in Orion closed-loop inference")
